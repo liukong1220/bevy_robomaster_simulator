@@ -38,10 +38,10 @@ use crate::systems::{
     ChassisObservationFrame, ControllerState, GameplaySystems, PreviousKinematicState,
     change_appearance, cleanup_projectiles, clear_controller_input, controller_dart_just_pressed,
     controller_shoot_pressed, dart_launch, following_controls, freecam_controls, gimbal_controls,
-    projectile_aerodynamics, projectile_launch, remote_gimbal_controls, remote_vehicle_controls,
-    sample_gamepad_controller, sample_keyboard_controller, screenshot_on_f2, screenshot_saving,
-    setup_projectile, switch_slapper_control, uav_launch, update_auto_aim_subscription,
-    update_chassis_observation, update_help_text, vehicle_controls,
+    log_projectile_stats, projectile_aerodynamics, projectile_launch, remote_gimbal_controls,
+    remote_vehicle_controls, sample_gamepad_controller, sample_keyboard_controller,
+    screenshot_on_f2, screenshot_saving, setup_projectile, switch_slapper_control, uav_launch,
+    update_auto_aim_subscription, update_chassis_observation, update_help_text, vehicle_controls,
 };
 
 #[cfg(feature = "ros2")]
@@ -190,7 +190,8 @@ fn main() {
                     .chain()
                     .in_set(GameplaySystems::Input),
                 // GameLogic phase
-                (change_appearance, update_help_text).in_set(GameplaySystems::GameLogic),
+                (change_appearance, update_help_text, log_projectile_stats)
+                    .in_set(GameplaySystems::GameLogic),
                 // Camera phase
                 (
                     freecam_controls.run_if(|mode: Res<CameraMode>| mode.0 == FollowingType::Free),

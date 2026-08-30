@@ -6,7 +6,13 @@ use crate::talos::capture::{TalosCaptureContext, TalosFrameStamp};
 use crate::talos::plugin::M_ALIGN_MAT3;
 use avian3d::prelude::AngularVelocity;
 use bevy::prelude::*;
+use std::collections::VecDeque;
+use std::sync::atomic::Ordering;
 use talos_ipc::*;
+
+/// 真值历史深度。图像比主世界当前帧晚约 2 帧（GPU 回读），留 16 帧余量足够，
+/// 单条 GroundTruthBatch 是几 KB，代价可以忽略。
+const GT_HISTORY_DEPTH: usize = 16;
 
 fn to_ros_vec3(v: Vec3) -> Vec3 {
     M_ALIGN_MAT3 * v
@@ -58,6 +64,8 @@ fn ros_yaw(global_tf: &GlobalTransform) -> f32 {
 pub fn publish_ground_truth_system(
     context: Option<Res<TalosCaptureContext>>,
     frame_stamp: Res<TalosFrameStamp>,
+    mut history: Local<VecDeque<GroundTruthBatch>>,
+    mut last_published_seq: Local<u64>,
     infantry_query: Query<
         (&GlobalTransform, Option<&AngularVelocity>, &Infantry),
         Without<Controlled>,
@@ -175,7 +183,35 @@ pub fn publish_ground_truth_system(
         batch.rune_count += 1;
     }
 
+    // 攒一段历史，只发布"与已落地图像同帧"的那一批。
+    //
+    // 直接发当前帧的真值是错的：图像要等 GPU 回读，实测比这里晚约 2 帧，等它进
+    // 共享内存时真值槽位早被后两帧覆盖了。消费侧 GroundTruthEvaluator::fetch()
+    // 要求 gt.frame_seq == image.frame_seq（这是对的，评估必须同帧），于是恒不
+    // 命中，--eval 一个样本都取不到。这里改成按图像实际发布进度回放真值，
+    // 共享内存布局和 ABI 版本都不用动。
+    //
+    // 真值只流向评估器，不进算法输入，这条边界不变。
+    history.push_back(batch);
+    while history.len() > GT_HISTORY_DEPTH {
+        history.pop_front();
+    }
+
+    let published_seq = ctx.published_image_seq.load(Ordering::Acquire);
+    // 图像帧率(约 8fps)远低于这里的调用频率，同一帧号会反复看到；只发一次。
+    if published_seq == 0 || published_seq == *last_published_seq {
+        return;
+    }
+    // 丢掉比已发布图像更旧的，它们再也不会被匹配上。
+    while history.front().is_some_and(|b| b.frame_seq < published_seq) {
+        history.pop_front();
+    }
+    let Some(matched) = history.front().filter(|b| b.frame_seq == published_seq) else {
+        return;
+    };
+
     if let Ok(mut publisher) = ctx.publisher.lock() {
-        publisher.publish_ground_truth(&batch);
+        publisher.publish_ground_truth(matched);
+        *last_published_seq = published_seq;
     }
 }

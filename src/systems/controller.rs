@@ -350,11 +350,21 @@ pub fn sample_gamepad_controller(
     }
 }
 
+/// Automated verification (headless CI, scripted closed-loop runs) has no way to
+/// press F5 or hold RT, so allow the subscription to be forced on from the
+/// environment. Mirrors `DAEDALUS_FORCE_TALOS_CAPTURE`; interactive behaviour is
+/// unchanged when the variable is absent.
+fn force_auto_aim_from_env() -> bool {
+    std::env::var("DAEDALUS_FORCE_AUTO_AIM")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 pub fn update_auto_aim_subscription(
     controller: Res<ControllerState>,
     enabled: Res<SubscribeAutoAim>,
 ) {
-    let active = controller.auto_aim_active();
+    let active = controller.auto_aim_active() || force_auto_aim_from_env();
     if enabled.swap(active, Ordering::AcqRel) != active {
         info!(
             "Auto-aim subscription is now {}.",

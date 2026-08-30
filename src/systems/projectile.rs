@@ -77,6 +77,14 @@ pub fn projectile_launch(
         Restitution::new(0.3),
         LinearDamping(config.projectile.linear_damping),
         GameLayer::projectile_collision_layers(true),
+        // 弹丸必须自带 CollisionEventsEnabled，否则 avian 不会为这一对实体发
+        // CollisionStart/CollisionEnd，robomaster/armor/collision.rs 里的
+        // handle_armor_collision 就永远不触发——车辆装甲板的命中统计整段是死代码
+        // （能量机关能统计，是因为 power_rune/construct.rs 自己加了这个组件）。
+        // 该 handler 命中后做的正是 `remove::<CollisionEventsEnabled>()`（对弹丸），
+        // 可见原本的设计就是由弹丸携带，spawn 时漏了。
+        // 实测：闭环虚拟开火 133 发、瞄准正确，accurate 恒为 0；补上后开始计数。
+        CollisionEventsEnabled,
         Mesh3d(setting.0.clone()),
         MeshMaterial3d(setting.1.clone()),
         LinearVelocity(vel),

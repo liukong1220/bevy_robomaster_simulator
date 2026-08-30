@@ -139,28 +139,28 @@ pub fn setup(
         CollisionMargin(0.001),
         Restitution::ZERO,
         WorldAssetRoot(asset_server.load(GltfAssetLabel::Scene(0).from_asset("POWER.glb"))),
-        Transform::IDENTITY,
+        Transform::from_translation(Vec3::from(config.scene.power_rune)),
         PowerRuneRoot,
         PreciousCollision(power_rune_col),
     ));
 
     commands.spawn((
         WorldAssetRoot(asset_server.load(GltfAssetLabel::Scene(0).from_asset("vehicle.glb"))),
-        Transform::from_xyz(0.0, 1.0, 0.0),
+        Transform::from_translation(Vec3::from(config.scene.controlled_infantry)),
         Infantry::new(Team::Red, INFANTRY_THREE_CONFIG),
         Controlled,
     ));
 
     commands.spawn((
         WorldAssetRoot(asset_server.load(GltfAssetLabel::Scene(0).from_asset("vehicle.glb"))),
-        Transform::from_xyz(1.0, 1.0, 1.0),
+        Transform::from_translation(Vec3::from(config.scene.blue_infantry)),
         Infantry::new(Team::Blue, INFANTRY_THREE_CONFIG),
         SlapperInfantry,
     ));
 
     commands.spawn((
         WorldAssetRoot(asset_server.load(GltfAssetLabel::Scene(0).from_asset("HERO.glb"))),
-        Transform::from_xyz(2.0, 1.0, 1.0),
+        Transform::from_translation(Vec3::from(config.scene.blue_hero)),
         Infantry::new(Team::Blue, HERO_ROBOT_CONFIG),
         SlapperInfantry,
         ActiveSlapper,

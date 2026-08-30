@@ -70,9 +70,14 @@ impl SnapshotSync for TalosSnapshotSync {
         _config: &CaptureConfig,
     ) -> Box<dyn SnapshotAsync> {
         let ctx = world.resource::<TalosCaptureContextShared>().0.clone();
+        let published_image_seq = world
+            .resource::<TalosCaptureContext>()
+            .published_image_seq
+            .clone();
 
         Box::new(TalosSnapshot {
             ctx,
+            published_image_seq,
             frame_seq: self.frame_seq,
             timestamp_ns: self.timestamp_ns,
             pose: self.pose,
@@ -82,6 +87,7 @@ impl SnapshotSync for TalosSnapshotSync {
 
 struct TalosSnapshot {
     ctx: Arc<Mutex<ShmPublisher>>,
+    published_image_seq: Arc<AtomicU64>,
     frame_seq: u64,
     timestamp_ns: u64,
     pose: CapturedPoseData,
@@ -112,7 +118,7 @@ impl SnapshotAsync for TalosSnapshot {
         }
 
         if let Ok(mut publisher) = self.ctx.lock() {
-            let _ = publisher.try_publish_synchronized_image(
+            let published = publisher.try_publish_synchronized_image(
                 frame.data,
                 self.frame_seq,
                 self.timestamp_ns,
@@ -120,6 +126,11 @@ impl SnapshotAsync for TalosSnapshot {
                     publish_pose_data(publisher, self.frame_seq, self.timestamp_ns, &self.pose);
                 },
             );
+            // 只有真的写成功才记账，否则真值会去对齐一帧根本没发出去的图像。
+            if published {
+                self.published_image_seq
+                    .store(self.frame_seq, Ordering::Release);
+            }
         }
     }
 }
@@ -155,6 +166,15 @@ pub struct TalosCaptureContextShared(pub Arc<Mutex<ShmPublisher>>);
 pub struct TalosCaptureContext {
     pub publisher: Arc<Mutex<ShmPublisher>>,
     pub fov_y: f32,
+    /// 最近一次**真正写进共享内存**的图像 frame_seq，0 表示还没有。
+    ///
+    /// 图像要等 GPU 回读完成才发布，实测比主世界当前帧晚约 2 帧；而真值
+    /// 只有一个槽位，等这张图落地时早就被后面两帧覆盖了，于是消费侧
+    /// `GroundTruthEvaluator::fetch()` 的同帧号校验恒不通过（实测 skew=2），
+    /// `--eval` 一个样本都取不到。这个原子量把"图像发到哪一帧了"从渲染世界
+    /// 送回主世界，真值发布系统据此从自己的短历史里挑同帧的那一批再发，
+    /// 不需要改共享内存布局，也不必给 ABI 升版本。
+    pub published_image_seq: Arc<AtomicU64>,
 }
 
 pub struct TalosCapturePlugin {

@@ -28,6 +28,11 @@ metalfx_frame_generation = true
 # Output/render resolution ratio used by MetalFX temporal upscaling.
 metalfx_scale = 2.0
 illuminance = 500.0
+# 采集相机曝光(EV100)。留空/删掉这一行则按 ev100 = log2(illuminance/2.5) 推，
+# 500 lux -> 7.64。实测 7.64/8.0 只能间歇检出(前若干帧一个装甲板都没有)，
+# tracker 攒不够连续帧就永远确认不了目标；6.0 起检测每帧稳定、tracker 全程锁定。
+# 相当于工业相机再加约 1.6 档增益，物理上合理。5.0 及更亮就整片过曝，检测反而归零。
+capture_ev100 = 6.0
 [capture.color]
 # RGB capture resolution for existing camera pipeline.
 width = 1440
@@ -88,3 +93,16 @@ fov = 45.0                      # degrees - field of view
 free_move_speed = 8.0           # m/s - free camera movement speed
 follow_offset = [0.0, 3.0, 2.0] # follow camera offset
 mouse_sensitivity = 0.003       # mouse look sensitivity
+
+[scene]
+# 出生点（Bevy 坐标，米：x 右 / y 上 / z 朝向观察者）。
+#
+# 默认场景把 GROUND / CALIB / OUTPOST / TECH_CORE / POWER 和我方步兵全放在原点，
+# 能量机关的扇叶正好在 1m 左右的高度，把第一人称相机整个包住，视觉算法一帧都看
+# 不到别的车。这里只把我方步兵挪出原点，赛场元素一个都不动：
+# 挪到 (3.5, 1.0, 1.0) 后，两台蓝车(1,1,1)/(2,1,1) 在 -x 方向 1.5m 和 2.5m 处，
+# 能量机关落在它们后面，正好当背景杂波。
+controlled_infantry = [3.5, 1.0, 1.0]
+blue_infantry = [1.0, 1.0, 1.0]
+blue_hero = [2.0, 1.0, 1.0]
+power_rune = [0.0, 0.0, 0.0]

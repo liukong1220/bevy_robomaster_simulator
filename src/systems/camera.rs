@@ -1,6 +1,5 @@
 use bevy::input::mouse::MouseMotion;
 use bevy::prelude::*;
-use std::f32::consts::PI;
 
 use crate::components::{
     CameraMode, Controlled, FollowingType, Infantry, InfantryGimbal, InfantryLaunchOffset,
@@ -23,23 +22,75 @@ pub fn update_camera_follow(
     camera_query: Single<(&mut Transform, &MainCamera), Without<Controlled>>,
     infantry: Single<&Transform, (With<Infantry>, With<Controlled>)>,
     gimbal: Single<&Transform, (With<Controlled>, With<InfantryGimbal>)>,
-    view_offset: Single<&Transform, (With<Controlled>, With<InfantryViewOffset>)>,
+    view_offset: Single<&GlobalTransform, (With<Controlled>, With<InfantryViewOffset>)>,
     launch_offset: Single<&Transform, (With<Controlled>, With<InfantryLaunchOffset>)>,
+    gimbal_global: Single<&GlobalTransform, (With<Controlled>, With<InfantryGimbal>)>,
     mode: Res<CameraMode>,
+    mut dbg_init: Local<bool>,
+    mut dbg_left: Local<i32>,
 ) {
     let gimbal_transform = gimbal.into_inner();
     let (mut camera_transform, camera_offset) = camera_query.into_inner();
 
     match mode.0 {
         FollowingType::Robot => {
-            let view_offset_transform = view_offset.into_inner();
             let gimbal_world_rotation = infantry.rotation * gimbal_transform.rotation;
-            let view_offset_world = gimbal_world_rotation * view_offset_transform.translation;
 
-            camera_transform.translation = infantry.translation + view_offset_world;
-            camera_transform.rotation = gimbal_world_rotation
-                * launch_offset.rotation
-                * Quat::from_euler(EulerRot::ZYX, 0.0, 0.0, PI / 2.0)
+            // 直接取 CAM_DIRECTION 这个挂载点的世界位姿。
+            //
+            // 原来是 `infantry.translation + gimbal_world_rotation * cam_local`，
+            // 这么算会漏掉 GIMBAL 节点自己相对车体根节点的平移（以及中间层级的
+            // 任何平移），结果相机被放低约 0.2m，正好落在车体壳子里面：
+            // 渲染出来上下两半都是自己的装甲板，只中间留一条缝，视觉算法完全看
+            // 不到别的车。用挂载点的 GlobalTransform 就没有这个系统性偏差。
+            //
+            // 代价是 GlobalTransform 是上一帧 PostUpdate 传播的，机器人运动时相机
+            // 位置会滞后一帧；这比 0.2m 的固定偏差小得多，而且发布给算法的外参是
+            // 在 ExtractSchedule 里按真实 GlobalTransform 算的，两边仍然自洽。
+            camera_transform.translation = view_offset.translation();
+            // 光轴 = 枪口朝向，不能再乘 Rx(90°)。
+            //
+            // 原来末尾多了个 `Quat::from_euler(EulerRot::ZYX, 0, 0, PI/2)`。那一项属于
+            // *发布*链路（talos/capture.rs 发反馈时带上，C++ 侧用
+            // SimGimbalConfig::feedback_pitch_fix_deg = 90 再除掉），渲染相机不该有：
+            // 实测下发 pitch=0 时反馈 pitch=0（枪口世界朝向 Bevy (0,0,-1)，水平），
+            // 而带上这一项的相机 forward 是 (0,1,0)，即镜头直勾勾朝天。
+            // 于是"图像"和"交给算法的位姿"整整差 90°，PnP 解出来的世界坐标必然错。
+            //
+            // 算法侧 R_camera2gimbal = [0,0,1, -1,0,0, 0,-1,0] 是纯轴置换、没有任何
+            // 安装倾角，也就是说它假设光轴与云台(枪口)轴重合——所以这里必须正好取
+            // 枪口朝向。
+            camera_transform.rotation = gimbal_world_rotation * launch_offset.rotation;
+
+            // 临时诊断：本地量算出来的朝向 vs 挂载点真实 GlobalTransform。
+            // 视觉链路要求"图像的相机位姿"和"发布给算法的相机位姿"是同一个，
+            // 这里就是用来确认两条链是否一致。DAEDALUS_DEBUG_CAMERA=N 打印 N 帧。
+            if !*dbg_init {
+                *dbg_init = true;
+                *dbg_left = std::env::var("DAEDALUS_DEBUG_CAMERA")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<i32>().ok())
+                    .unwrap_or(0);
+            }
+            {
+                if *dbg_left > 0 {
+                    *dbg_left -= 1;
+                    let cam_g = view_offset.into_inner();
+                    let gim_g = gimbal_global.into_inner();
+                    let q = |r: Quat| format!("[{:.5},{:.5},{:.5},{:.5}]", r.x, r.y, r.z, r.w);
+                    info!(
+                        "[camdbg] rendered_q={} launch_local_q={} gimbal_local_q={} infantry_q={} gimbal_global_q={} cam_global_q={} cam_pos={:?} gim_pos={:?}",
+                        q(camera_transform.rotation),
+                        q(launch_offset.rotation),
+                        q(gimbal_transform.rotation),
+                        q(infantry.rotation),
+                        q(gim_g.rotation()),
+                        q(cam_g.rotation()),
+                        cam_g.translation(),
+                        gim_g.translation(),
+                    );
+                }
+            }
         }
         FollowingType::ThirdPerson => {
             let base_transform = infantry.into_inner();

@@ -13,7 +13,7 @@ use bevy::ecs::system::RunSystemOnce;
 use bevy::image::BevyDefault;
 use bevy::prelude::*;
 use bevy::render::render_resource::TextureFormat;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use talos_ipc::*;
 
@@ -72,6 +72,7 @@ impl Plugin for TalosPlugin {
         let capture_context = TalosCaptureContext {
             publisher: publisher.clone(),
             fov_y: self.config.fov_y,
+            published_image_seq: Arc::new(AtomicU64::new(0)),
         };
 
         app.init_resource::<TalosFrameStamp>();

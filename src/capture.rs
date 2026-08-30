@@ -2,7 +2,7 @@ pub mod depth;
 pub mod driver;
 pub mod view_copy;
 
-use bevy::camera::RenderTarget;
+use bevy::camera::{Exposure, RenderTarget};
 use bevy::core_pipeline::prepass::DepthPrepass;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::prelude::*;
@@ -37,6 +37,13 @@ pub fn setup_capture_camera(world: &mut World) {
 
     let render_target_handle = world.resource::<ImageHandle>().0.clone();
     let fov = world.resource::<CameraFov>().0;
+    // 曝光必须显式给：Bevy 默认 Exposure::BLENDER(EV100 9.7) 是按白天户外测的光，
+    // 配上赛场量级的 illuminance(几百 lux)，所有非自发光表面都会挤在个位数灰度上，
+    // 检测器只能看到装甲灯条(灯条 emissive_exposure_weight=-1，不受曝光影响)。
+    // 见 RenderConfig::capture_ev100。
+    let exposure = Exposure {
+        ev100: capture_ev100(world),
+    };
     let metalfx = world
         .get_resource::<SimulationConfig>()
         .filter(|config| cfg!(target_os = "macos") && config.render.metalfx_temporal)
@@ -49,6 +56,7 @@ pub fn setup_capture_camera(world: &mut World) {
     let mut capture_camera = world.spawn((
         Camera3d::default(),
         Tonemapping::None,
+        exposure,
         RenderTarget::Image(render_target_handle.into()),
         Camera {
             order: CAPTURE_CAMERA_ORDER,
@@ -117,6 +125,32 @@ pub fn setup_preview_window(world: &mut World) {
             ImageNode::new(render_target_handle),
             PreviewImageNode,
         ));
+    }
+}
+
+/// 采集相机的 EV100：优先取配置，否则按入射光公式从 illuminance 推。
+///
+/// `ev100 = log2(lux / 2.5)` 能复现 Bevy 自己的档位（100k lux -> 15 = SUNLIGHT，
+/// 400 lux -> 7 = INDOOR），所以这不是拍脑袋的系数，而是和引擎同一套约定。
+fn capture_ev100(world: &World) -> f32 {
+    // 标定/排查用的临时覆盖，优先级最高，不需要改配置文件。
+    if let Ok(raw) = std::env::var("DAEDALUS_CAPTURE_EV100") {
+        match raw.trim().parse::<f32>() {
+            Ok(ev100) if ev100.is_finite() => return ev100,
+            _ => warn!("DAEDALUS_CAPTURE_EV100 不是有效数字，已忽略: {raw:?}"),
+        }
+    }
+    let Some(config) = world.get_resource::<SimulationConfig>() else {
+        return Exposure::default().ev100;
+    };
+    if let Some(ev100) = config.render.capture_ev100 {
+        return ev100;
+    }
+    let lux = config.render.illuminance;
+    if lux > 0.0 {
+        (lux / 2.5).log2()
+    } else {
+        Exposure::default().ev100
     }
 }
 

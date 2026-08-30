@@ -26,6 +26,39 @@ pub struct SimulationConfig {
     pub mecanum: MecanumConfig,
     pub projectile: ProjectileConfig,
     pub camera: CameraConfig,
+    #[serde(default)]
+    pub scene: SceneConfig,
+}
+
+/// 场景里几个硬编码出生点的可配置版本，单位是米，坐标是 Bevy 约定
+/// （x 右、y 上、z 朝向观察者）。默认值与原来写死的值完全一致。
+///
+/// 加这个是因为默认场景把能量机关(POWER.glb, Transform::IDENTITY)和我方步兵
+/// (原来是 (0,1,0)) 摆在同一个原点上：机关的叶片正好在 1m 左右的高度，第一人称
+/// 相机(云台上方约 0.2m)会被扇叶完全包住，视觉算法一帧都看不到别的车。
+/// 这在调试场景里无所谓，但要跑图像->检测的闭环就必须能把出生点挪开。
+#[derive(Deserialize, Reflect, Clone)]
+#[serde(default)]
+pub struct SceneConfig {
+    /// 我方（受控）步兵的出生平移。
+    pub controlled_infantry: [f32; 3],
+    /// 蓝方步兵（3 号）的出生平移。
+    pub blue_infantry: [f32; 3],
+    /// 蓝方英雄（1 号）的出生平移。
+    pub blue_hero: [f32; 3],
+    /// 能量机关根节点的平移。
+    pub power_rune: [f32; 3],
+}
+
+impl Default for SceneConfig {
+    fn default() -> Self {
+        Self {
+            controlled_infantry: [0.0, 1.0, 0.0],
+            blue_infantry: [1.0, 1.0, 1.0],
+            blue_hero: [2.0, 1.0, 1.0],
+            power_rune: [0.0, 0.0, 0.0],
+        }
+    }
 }
 
 #[derive(Deserialize, Reflect, Clone)]
@@ -75,6 +108,19 @@ impl Default for PreviewConfig {
 #[serde(default)]
 pub struct RenderConfig {
     pub illuminance: f32,
+    /// Exposure (EV100) used by the capture camera that feeds the vision pipeline.
+    ///
+    /// `None` derives it from `illuminance` with the incident-light relation
+    /// `ev100 = log2(lux / 2.5)`, which reproduces Bevy's own presets
+    /// (`EV100_SUNLIGHT` 15 ~ 100k lux, `EV100_INDOOR` 7 ~ 400 lux).
+    ///
+    /// This matters because Bevy's default is `Exposure::BLENDER` (EV100 9.7),
+    /// i.e. metered for bright daylight. Paired with an arena-realistic
+    /// `illuminance` of a few hundred lux, every surface renders at a handful of
+    /// 8-bit levels, so a detector sees nothing but the emissive light bars
+    /// (those bypass exposure via `emissive_exposure_weight = -1.0`).
+    /// Set an explicit value to model a camera with extra gain.
+    pub capture_ev100: Option<f32>,
     pub shadows: bool,
     pub main_camera_fxaa: bool,
     #[serde(alias = "main_camera_metalfx_temporal")]
@@ -89,6 +135,7 @@ impl Default for RenderConfig {
     fn default() -> Self {
         Self {
             illuminance: 50.0,
+            capture_ev100: None,
             shadows: false,
             main_camera_fxaa: false,
             metalfx_temporal: cfg!(target_os = "macos"),
@@ -320,6 +367,7 @@ impl Default for SimulationConfig {
                     follow_offset: [0.0, 3.0, 2.0],
                     mouse_sensitivity: 0.003,
                 },
+                scene: SceneConfig::default(),
             }
         })
     }
