@@ -55,19 +55,24 @@ pub fn projectile_launch(
     >,
     launch_offset: Single<&Transform, (With<Controlled>, With<InfantryLaunchOffset>)>,
 ) {
+    let launch_offset = launch_offset.into_inner();
     cooldown.tick(time.delta());
     if !cooldown.is_finished() {
         return;
     }
     cooldown.reset();
 
-    stats.increase_launch();
+    // 方向退化时必须在计数之前退出。原来 increase_launch() 在这道早退之上，
+    // 于是 HUD 的 total 会一直涨、却没有任何弹丸被 spawn，表现正是"弹丸总数
+    // 在增加但看不到真实发弹和轨迹"。计数必须只统计真正出膛的弹丸，否则
+    // accurate/total 这个命中率分母本身就是假的。
     let direction = (gimbal.0.rotation() * launch_offset.rotation)
         .mul_vec3(Vec3::Y)
         .normalize_or_zero();
     if direction == Vec3::ZERO {
         return;
     }
+    stats.increase_launch();
     let vel = infantry.1.0 + direction * config.projectile.speed;
     commands.spawn((
         RigidBody::Dynamic,

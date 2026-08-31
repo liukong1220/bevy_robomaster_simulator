@@ -1,7 +1,7 @@
 use crate::layout::*;
 use crate::shm::{ShmError, ShmRegion};
 use crate::triple_buffer::TripleBufferProducer;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct ShmPublisher {
@@ -194,10 +194,33 @@ impl ShmPublisher {
         }
     }
 
+    /// seqlock 提交真值批次。
+    ///
+    /// 之前是直接整块赋值，消费端只能靠"memcpy 前后读到同一个 frame_seq"来猜这份
+    /// 拷贝是否完整——那不是同步保证：同一帧号内重发时 frame_seq 根本不变，
+    /// targets[] 却在被改写，消费端会拿到半新半旧的一批目标；反过来编译器/CPU
+    /// 也可以先写 frame_seq 再写 body。
+    ///
+    /// 现在是标准 seqlock：奇数 = 正在写，偶数 = 稳定。序号本身在 body 之内，
+    /// 所以整块赋值前先把它填成本次的奇数序号，避免 body 写入过程中序号短暂变回
+    /// 别的值（那会让消费端的前后比较意外通过）。
     pub fn publish_ground_truth(&mut self, batch: &GroundTruthBatch) {
         unsafe {
             let meta = self.meta_region.as_mut::<ShmMetaRegion>();
-            meta.ground_truth = *batch;
+            let seq = &*(core::ptr::addr_of!(meta.ground_truth.seqlock) as *const AtomicU32);
+
+            // 上一次提交后的序号一定是偶数（初始 0 也是偶数）。
+            let begin = seq.load(Ordering::Relaxed).wrapping_add(1) | 1;
+            seq.store(begin, Ordering::Release);
+
+            // body 的写入不允许被重排到 begin 之前。
+            core::sync::atomic::fence(Ordering::Release);
+            let mut staged = *batch;
+            staged.seqlock = begin;
+            meta.ground_truth = staged;
+            core::sync::atomic::fence(Ordering::Release);
+
+            seq.store(begin.wrapping_add(1), Ordering::Release);
         }
     }
 

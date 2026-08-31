@@ -2913,6 +2913,7 @@ dependencies = [
  "exact",
  "ffmpeg-next",
  "futures",
+ "icu_provider",
  "image",
  "notify",
  "objc2 0.6.4",
@@ -4009,6 +4010,7 @@ checksum = "139c4cf31c8b5f33d7e199446eff9c1e02decfc2f0eec2c8d71f65befa45b421"
 dependencies = [
  "displaydoc",
  "icu_locale_core",
+ "log",
  "serde",
  "stable_deref_trait",
  "writeable",

@@ -18,6 +18,7 @@ mod talos;
 
 use avian3d::prelude::*;
 use bevy::diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin};
+use bevy::log::LogPlugin;
 use bevy::prelude::*;
 use bevy::render::settings::{InstanceFlags, RenderCreation, WgpuSettings, WgpuSettingsPriority};
 use bevy::render::{RenderPlugin, RenderSystems};
@@ -40,7 +41,8 @@ use crate::systems::{
     controller_shoot_pressed, dart_launch, following_controls, freecam_controls, gimbal_controls,
     log_projectile_stats, projectile_aerodynamics, projectile_launch, remote_gimbal_controls,
     remote_vehicle_controls, sample_gamepad_controller, sample_keyboard_controller,
-    screenshot_on_f2, screenshot_saving, setup_projectile, switch_slapper_control, uav_launch,
+    screenshot_on_f2, screenshot_on_timer, screenshot_saving, setup_projectile,
+    switch_slapper_control, uav_launch,
     update_auto_aim_subscription, update_chassis_observation, update_help_text, vehicle_controls,
 };
 
@@ -117,6 +119,23 @@ fn main() {
     let mut app = App::new();
     app.add_plugins((
         DefaultPlugins
+            .set(LogPlugin {
+                // parley/icu_segmenter 在给中日韩文本做断行时会去找 "cjdict"
+                // 分词模型；bevy 编译进来的 icu 数据里没有它，于是每次文字整形
+                // 都报一条 "No segmentation model for language: ja"。HUD 在开火
+                // 时计数每帧都变 -> 每帧重新整形 -> 每帧一条，实测 60s 闭环跑出
+                // 7005 行里有 6208 行是它，真正有用的日志（真值溢出、故障、诊断）
+                // 全被冲掉。缺这个模型只影响 CJK 断行位置的优选，HUD 是单行短
+                // 文本，没有可见影响。
+                //
+                // 光有这条指令不够，还必须在 Cargo.toml 里给 icu_provider 打开
+                // logging feature：不开时它内部用的是 `pub use std::eprintln as
+                // warn`，裸 eprintln 没有 tracing target，任何按 target 过滤的
+                // 指令都匹配不到（这就是之前以为压住了、开火时又刷回来的原因）。
+                // 两处是一对，改一处等于没改。
+                filter: format!("{}icu_provider=error", bevy::log::DEFAULT_FILTER),
+                ..default()
+            })
             .set(WindowPlugin {
                 primary_window: Some(Window {
                     present_mode,
@@ -205,6 +224,7 @@ fn main() {
                     cleanup_projectiles,
                     screenshot_on_f2
                         .run_if(|input: Res<ButtonInput<KeyCode>>| input.just_pressed(KeyCode::F2)),
+                    screenshot_on_timer,
                     screenshot_saving,
                 )
                     .in_set(GameplaySystems::Cleanup),

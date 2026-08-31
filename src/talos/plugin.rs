@@ -6,8 +6,8 @@ use crate::components::{
 use crate::config::SimulationConfig;
 use crate::systems::projectile_launch;
 use crate::talos::capture::{
-    TalosCaptureContext, TalosCapturePlugin, TalosFrameStamp, advance_talos_frame_stamp,
-    publish_talos_runtime_state_system,
+    NO_PUBLISHED_IMAGE, TalosCaptureContext, TalosCapturePlugin, TalosFrameStamp,
+    advance_talos_frame_stamp, publish_talos_runtime_state_system,
 };
 use bevy::ecs::system::RunSystemOnce;
 use bevy::image::BevyDefault;
@@ -72,7 +72,7 @@ impl Plugin for TalosPlugin {
         let capture_context = TalosCaptureContext {
             publisher: publisher.clone(),
             fov_y: self.config.fov_y,
-            published_image_seq: Arc::new(AtomicU64::new(0)),
+            published_image_seq: Arc::new(AtomicU64::new(NO_PUBLISHED_IMAGE)),
         };
 
         app.init_resource::<TalosFrameStamp>();

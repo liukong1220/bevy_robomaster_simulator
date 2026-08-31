@@ -175,9 +175,17 @@ pub struct GroundTruthTarget {
     pub position: [f32; 3],
     pub vyaw: f32,
     pub yaw: f32,
-    pub _pad: [u8; 24],
+    /// 被选中装甲板板心在 odom 系下的位置。整车中心（`position`）不是自瞄真正
+    /// 瞄的点：板心偏心半径约 0.2m、比车心高约 0.06m，1.5m 距离上折算 2 度量级。
+    /// 消费端拿整车中心算瞄准误差会把这段固定几何差当成闭环残差。
+    /// `armor_position_valid == 0` 时该字段无意义。占用原 `_pad` 的前 16 字节。
+    pub armor_position: [f32; 3],
+    pub armor_position_valid: u8,
+    pub _pad: [u8; 11],
 }
 const _: () = assert!(size_of::<GroundTruthTarget>() == 64);
+const _: () = assert!(core::mem::offset_of!(GroundTruthTarget, armor_position) == 40);
+const _: () = assert!(core::mem::offset_of!(GroundTruthTarget, armor_position_valid) == 52);
 
 #[repr(C, align(64))]
 #[derive(Debug, Clone, Copy)]
@@ -239,9 +247,15 @@ pub struct GroundTruthBatch {
     pub rune_count: u32,
     pub targets: [GroundTruthTarget; GROUND_TRUTH_MAX_TARGETS],
     pub runes: [GroundTruthRune; GROUND_TRUTH_MAX_RUNES],
-    pub _pad: [u8; 64],
+    /// seqlock 序号。发布端写 body 之前置奇、写完置偶；消费端读到奇数或前后不等
+    /// 就重试。原来消费端靠"memcpy 前后 frame_seq 相等"近似判断整块稳定，那不是
+    /// 同步保证：同一帧号内重发时 frame_seq 不变，body 却在被改写。
+    /// 占用原 `_pad` 的前 4 字节。
+    pub seqlock: u32,
+    pub _pad: [u8; 60],
 }
 const _: () = assert!(size_of::<GroundTruthBatch>() == 1664);
+const _: () = assert!(core::mem::offset_of!(GroundTruthBatch, seqlock) == 1600);
 
 impl Default for GroundTruthBatch {
     fn default() -> Self {
@@ -252,7 +266,8 @@ impl Default for GroundTruthBatch {
             rune_count: 0,
             targets: [GroundTruthTarget::default(); GROUND_TRUTH_MAX_TARGETS],
             runes: [GroundTruthRune::default(); GROUND_TRUTH_MAX_RUNES],
-            _pad: [0; 64],
+            seqlock: 0,
+            _pad: [0; 60],
         }
     }
 }

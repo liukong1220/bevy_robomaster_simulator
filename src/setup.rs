@@ -33,7 +33,7 @@ pub fn setup(
     if let Some(mut egui_global_settings) = egui_global_settings {
         egui_global_settings.auto_create_primary_context = false;
     }
-    spawn_text(&mut commands);
+    spawn_text(&mut commands, &asset_server);
     commands.spawn((
         DirectionalLight {
             color: Color::srgb(0.9, 0.95, 1.0),

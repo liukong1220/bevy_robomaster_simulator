@@ -38,6 +38,21 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4.6", features = ["derive"] }
 ffmpeg-next = { version = "8.1.0", optional = true }
+# 不在代码里 use，唯一目的是打开 icu_provider 的 logging feature。
+#
+# parley/icu_segmenter 给中日韩文本断行时要找 "cjdict" 分词模型，bevy 编译进来的
+# icu 数据里没有，于是每次文字整形都报一次 "No segmentation model for language: ja"。
+# 关键在于这条消息**默认不走 tracing**：icu_provider 的 logging feature 关掉时，
+# 它内部的 `log::warn!` 是 `pub use std::eprintln as warn`（见 icu_provider
+# src/lib.rs 的 log shim，只受 debug_assertions 约束），直接 eprintln 到 stderr。
+# 所以 LogPlugin 里 `icu_provider=error` 这类按 target 过滤的指令根本匹配不到它
+# ——裸 eprintln 没有 target。打开 logging 后它改走 log facade，bevy 的
+# LogTracer 会把 log 记录桥进 tracing（target = 模块路径 icu_provider::error），
+# 那条过滤指令才真正生效。
+#
+# 用直接依赖来开 feature 是因为 feature 统一：icu_provider 是 bevy 的间接依赖，
+# 没法从 bevy 那边指定。版本要与 Cargo.lock 中 bevy 拉进来的一致。
+icu_provider = { version = "2.2", default-features = false, features = ["logging"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"

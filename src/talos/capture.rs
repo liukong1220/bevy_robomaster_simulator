@@ -20,6 +20,14 @@ use talos_ipc::*;
 
 static FRAME_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// `published_image_seq` 的"还没有发布过任何图像"哨兵。
+///
+/// 不能用 0：`FRAME_SEQ.fetch_add(1, ..)` 返回自增前的值，所以第一张真正发出去
+/// 的图像 frame_seq 就是 0。原来用 `== 0` 当哨兵会让第 0 帧的真值永远发不出去，
+/// 而这恰好是启动后目标刚进视野、最需要看清估计误差的那一帧。
+/// `u64::MAX` 不可能被 frame_seq 取到（每帧 +1，溢出需要 5.8e11 年）。
+pub const NO_PUBLISHED_IMAGE: u64 = u64::MAX;
+
 #[derive(Resource, Debug, Clone, Copy, Default)]
 pub struct TalosFrameStamp {
     pub frame_seq: u64,
@@ -166,7 +174,8 @@ pub struct TalosCaptureContextShared(pub Arc<Mutex<ShmPublisher>>);
 pub struct TalosCaptureContext {
     pub publisher: Arc<Mutex<ShmPublisher>>,
     pub fov_y: f32,
-    /// 最近一次**真正写进共享内存**的图像 frame_seq，0 表示还没有。
+    /// 最近一次**真正写进共享内存**的图像 frame_seq，
+    /// [`NO_PUBLISHED_IMAGE`] 表示还没有发布过任何图像。
     ///
     /// 图像要等 GPU 回读完成才发布，实测比主世界当前帧晚约 2 帧；而真值
     /// 只有一个槽位，等这张图落地时早就被后面两帧覆盖了，于是消费侧

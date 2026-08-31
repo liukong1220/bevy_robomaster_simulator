@@ -20,16 +20,16 @@ impl ControllerHelp {
     const fn keyboard() -> Self {
         Self {
             source: "keyboard",
-            manual: "F3 Camera | WASD Move | Arrows Aim | Space Shoot | G Dart | Q Gyro | U Remote Gyro | F5 AutoAim | Tab Slapper",
-            auto_aim: "F5 AutoAim Off | WASD Move | Q Gyro | U Remote Gyro | external fire_advice shoots | Tab Slapper",
+            manual: "F3 视角 | WASD 移动 | 方向键 瞄准 | 空格 射击 | G 飞镖 | Q 小陀螺 | U 远程小陀螺 | F5 自瞄 | Tab 拍打",
+            auto_aim: "F5 关闭自瞄 | WASD 移动 | Q 小陀螺 | U 远程小陀螺 | 由外部 fire_advice 控制射击 | Tab 拍打",
         }
     }
 
     const fn xbox() -> Self {
         Self {
             source: "xbox",
-            manual: "View Camera | LS Move | L3 Boost | DPad Slapper Move | RS Aim | R3+RS Slapper Roll/Pitch | LB Gyro | Y Slapper Gyro | RB Shoot | X Dart | hold RT AutoAim",
-            auto_aim: "release RT AutoAim Off | LS Move | L3 Boost | DPad Slapper Move | R3+RS Slapper Roll/Pitch | LB Gyro | Y Slapper Gyro | external fire_advice shoots",
+            manual: "View 视角 | LS 移动 | L3 加速 | 十字键 拍打移动 | RS 瞄准 | R3+RS 拍打翻滚/俯仰 | LB 小陀螺 | Y 拍打小陀螺 | RB 射击 | X 飞镖 | 按住 RT 自瞄",
+            auto_aim: "松开 RT 关闭自瞄 | LS 移动 | L3 加速 | 十字键 拍打移动 | R3+RS 拍打翻滚/俯仰 | LB 小陀螺 | Y 拍打小陀螺 | 由外部 fire_advice 控制射击",
         }
     }
 }
@@ -155,16 +155,17 @@ impl ControllerState {
         self.help.source
     }
 
-    pub fn help_mode(&self) -> &'static str {
-        if self.auto_aim_active() {
-            "auto-aim"
-        } else {
-            "manual"
-        }
+    /// HUD 的模式与操作提示必须按**实际生效**的订阅状态显示，而不是
+    /// `auto_aim_active()`。后者只看 F5/RT，而 `DAEDALUS_FORCE_AUTO_AIM=1`
+    /// 也会打开订阅（见 `update_auto_aim_subscription`）：脚本化启动时云台
+    /// 已经在吃共享内存里的 gimbal_cmd，HUD 却仍显示"模式=manual / 方向键
+    /// 瞄准"，与同一行的"自瞄=开"自相矛盾，也会让人误判自瞄没生效。
+    pub fn help_mode(&self, auto_aim: bool) -> &'static str {
+        if auto_aim { "自瞄" } else { "手动" }
     }
 
-    pub fn help_controls(&self) -> &'static str {
-        if self.auto_aim_active() {
+    pub fn help_controls(&self, auto_aim: bool) -> &'static str {
+        if auto_aim {
             self.help.auto_aim
         } else {
             self.help.manual
@@ -545,12 +546,18 @@ mod tests {
         controller.use_help(ControllerHelp::xbox());
 
         assert_eq!(controller.help_source(), "xbox");
-        assert_eq!(controller.help_mode(), "manual");
-        assert!(controller.help_controls().contains("hold RT"));
+        assert_eq!(controller.help_mode(false), "手动");
+        assert!(controller.help_controls(false).contains("按住 RT"));
 
+        // 生效标志由调用方传入，与 auto_aim_active() 解耦：DAEDALUS_FORCE_AUTO_AIM
+        // 场景下 F5/RT 都没按过，但订阅是开的，HUD 必须显示"自瞄"。
+        assert_eq!(controller.help_mode(true), "自瞄");
+        assert!(controller.help_controls(true).contains("松开 RT"));
+
+        // auto_aim_active() 仍然只反映 F5/RT，这正是它不能直接用于 HUD 的原因。
+        assert!(!controller.auto_aim_active());
         controller.controlled.auto_aim = true;
-        assert_eq!(controller.help_mode(), "auto-aim");
-        assert!(controller.help_controls().contains("release RT"));
+        assert!(controller.auto_aim_active());
     }
 
     #[test]

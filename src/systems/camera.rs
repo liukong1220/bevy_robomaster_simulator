@@ -1,5 +1,6 @@
 use bevy::input::mouse::MouseMotion;
 use bevy::prelude::*;
+use core::f32::consts::PI;
 
 use crate::components::{
     CameraMode, Controlled, FollowingType, Infantry, InfantryGimbal, InfantryLaunchOffset,
@@ -48,19 +49,26 @@ pub fn update_camera_follow(
             // 位置会滞后一帧；这比 0.2m 的固定偏差小得多，而且发布给算法的外参是
             // 在 ExtractSchedule 里按真实 GlobalTransform 算的，两边仍然自洽。
             camera_transform.translation = view_offset.translation();
-            // 光轴 = 枪口朝向，不能再乘 Rx(90°)。
+            // 光轴必须与**枪口**重合，所以要带上 Rx(90°)。
             //
-            // 原来末尾多了个 `Quat::from_euler(EulerRot::ZYX, 0, 0, PI/2)`。那一项属于
-            // *发布*链路（talos/capture.rs 发反馈时带上，C++ 侧用
-            // SimGimbalConfig::feedback_pitch_fix_deg = 90 再除掉），渲染相机不该有：
-            // 实测下发 pitch=0 时反馈 pitch=0（枪口世界朝向 Bevy (0,0,-1)，水平），
-            // 而带上这一项的相机 forward 是 (0,1,0)，即镜头直勾勾朝天。
-            // 于是"图像"和"交给算法的位姿"整整差 90°，PnP 解出来的世界坐标必然错。
+            // 关键点：在 LAUNCH/CAM 这个挂载点的局部系里，枪管前向是 +Y，而 bevy
+            // 相机的视线方向是 -Z。两者差的正是绕局部 X 轴的 90°：
+            //     Rx(90°) * (0,0,-1) = (0,1,0)
+            // 所以只有右乘 Rx(90°)，相机的 forward 才等于 `projectile_launch` 真正
+            // 用来发射弹丸的 `(gimbal_rot * launch_rot) * Vec3::Y`。
             //
-            // 算法侧 R_camera2gimbal = [0,0,1, -1,0,0, 0,-1,0] 是纯轴置换、没有任何
-            // 安装倾角，也就是说它假设光轴与云台(枪口)轴重合——所以这里必须正好取
-            // 枪口朝向。
-            camera_transform.rotation = gimbal_world_rotation * launch_offset.rotation;
+            // 曾经把这一项当成"发布链路特有的多余滚转"删掉，那是把两个不同的
+            // 前向约定混为一谈了。删掉之后相机 forward = M*(0,0,-1)，与枪口
+            // M*(0,1,0) 相差 90°：本机场景初始 launch_local 是绕 X -65°，于是枪口
+            // 指向 (0,0.4226,-0.9063) 而镜头指向 (0,-0.9063,-0.4226)，镜头被压进自己
+            // 底盘里 —— 渲染出来满屏都是本车装甲板，算法自然什么也看不到。
+            //
+            // 算法侧 R_camera2gimbal = [0,0,1, -1,0,0, 0,-1,0] 是纯轴置换、没有安装
+            // 倾角，即它假设光轴与枪口轴重合；talos/capture.rs 发布反馈时用的也是
+            // 同一个 Rx(90°)。三处必须一致，改一处就要同时改另两处。
+            camera_transform.rotation = gimbal_world_rotation
+                * launch_offset.rotation
+                * Quat::from_euler(EulerRot::ZYX, 0.0, 0.0, PI / 2.0);
 
             // 临时诊断：本地量算出来的朝向 vs 挂载点真实 GlobalTransform。
             // 视觉链路要求"图像的相机位姿"和"发布给算法的相机位姿"是同一个，
