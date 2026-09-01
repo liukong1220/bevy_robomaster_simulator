@@ -69,7 +69,7 @@ pub struct ExtractedPoseData {
 
 /// Pose data captured at frame snapshot time
 #[derive(Clone)]
-struct CapturedPoseData {
+pub(crate) struct CapturedPoseData {
     /// 云台回转中心的世界位置（ROS 约定）。
     gimbal_ros: [f32; 3],
     /// 枪管的世界姿态 `world <- gimbal`（ROS 约定，`[w,x,y,z]`）。
@@ -336,7 +336,7 @@ fn extract_pose_data(
     pose_data.valid = true;
 }
 
-fn captured_pose_data(
+pub(crate) fn captured_pose_data(
     cam_transform: &GlobalTransform,
     gimbal_transform: &GlobalTransform,
     muzzle_global: &GlobalTransform,
@@ -397,7 +397,7 @@ fn captured_pose_data(
     }
 }
 
-fn publish_pose_data(
+pub(crate) fn publish_pose_data(
     publisher: &mut ShmPublisher,
     frame_seq: u64,
     timestamp_ns: u64,

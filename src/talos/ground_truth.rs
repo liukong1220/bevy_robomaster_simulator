@@ -81,6 +81,62 @@ enum PlateReference {
     CenterNodeOrPlateRoot,
 }
 
+/// A candidate plate reference in Bevy world coordinates.
+#[derive(Copy, Clone)]
+struct PlateCandidate {
+    distance_squared: f32,
+    world: Vec3,
+    outpost_radius_m: f32,
+}
+
+/// The outpost has a three-plate ring: valid plate roots share one horizontal radius in the
+/// current `OutpostRotator` local frame.  An asset node can be named like an armor root without
+/// being one of those three plates, so names are deliberately not part of this decision.
+///
+/// Two agreeing roots are enough to retain a useful degraded sample when an asset constructor
+/// cannot build one normal plate.  A singleton is not evidence of a ring model, so it is safer to
+/// leave `armor_position_valid=0` than publish an arbitrary root as a precision reference.
+const OUTPOST_RADIUS_MODEL_MIN_INLIERS: usize = 2;
+const OUTPOST_RADIUS_MODEL_REL_TOLERANCE: f32 = 0.20;
+const OUTPOST_RADIUS_MODEL_ABS_TOLERANCE_M: f32 = 0.02;
+const OUTPOST_RADIUS_MODEL_MIN_RADIUS_M: f32 = 0.05;
+
+fn select_outpost_plate_reference(candidates: &[PlateCandidate]) -> Option<Vec3> {
+    // Fit the densest equal-radius cluster instead of trusting an asset label or an absolute
+    // radius.  The intended model has three members; a two-member cluster remains admissible for
+    // the known constructor-degraded case, while an isolated far-away node is rejected.
+    let mut best_model: Option<(usize, f32)> = None;
+    for candidate in candidates {
+        let radius = candidate.outpost_radius_m;
+        if !radius.is_finite() || radius < OUTPOST_RADIUS_MODEL_MIN_RADIUS_M {
+            continue;
+        }
+        let tolerance =
+            (radius * OUTPOST_RADIUS_MODEL_REL_TOLERANCE).max(OUTPOST_RADIUS_MODEL_ABS_TOLERANCE_M);
+        let support = candidates
+            .iter()
+            .filter(|other| (other.outpost_radius_m - radius).abs() <= tolerance)
+            .count();
+        if best_model.is_none_or(|(best_support, best_radius)| {
+            support > best_support || (support == best_support && radius < best_radius)
+        }) {
+            best_model = Some((support, radius));
+        }
+    }
+
+    let (support, radius) = best_model?;
+    if support < OUTPOST_RADIUS_MODEL_MIN_INLIERS {
+        return None;
+    }
+    let tolerance =
+        (radius * OUTPOST_RADIUS_MODEL_REL_TOLERANCE).max(OUTPOST_RADIUS_MODEL_ABS_TOLERANCE_M);
+    candidates
+        .iter()
+        .filter(|candidate| (candidate.outpost_radius_m - radius).abs() <= tolerance)
+        .min_by(|a, b| a.distance_squared.total_cmp(&b.distance_squared))
+        .map(|candidate| candidate.world)
+}
+
 /// 找到"自瞄真正会瞄的那块装甲板"的板位世界位置（ROS 系）。
 ///
 /// 为什么需要它：真值里的 `position` 是整车中心，而自瞄解算出来、planner 追的是
@@ -100,7 +156,10 @@ fn select_plate_reference(
     armor_roots: &Query<(Entity, &Armor), With<ArmorRoot>>,
     transforms: &Query<&GlobalTransform>,
 ) -> Option<Vec3> {
-    let mut best: Option<(f32, Vec3)> = None;
+    let rotor_tf = (reference == PlateReference::CenterNodeOrPlateRoot)
+        .then(|| transforms.get(root).ok())
+        .flatten();
+    let mut candidates = Vec::new();
 
     for (plate, _armor) in armor_roots.iter() {
         // 这块板属于哪个目标：沿父链找，与 armor/collision.rs 里判定命中的写法一致。
@@ -138,13 +197,27 @@ fn select_plate_reference(
         };
 
         let world = center_tf.translation();
-        let d = world.distance_squared(camera_pos);
-        if best.is_none_or(|(bd, _)| d < bd) {
-            best = Some((d, world));
-        }
+        let outpost_radius_m = rotor_tf.map_or(0.0, |rotor_tf| {
+            // Convert the candidate back to the *current* rotating local frame.  This remains
+            // invariant after any yaw of the outpost or an ancestor, unlike comparing world x/z.
+            let local = rotor_tf.rotation().inverse() * (world - rotor_tf.translation());
+            Vec2::new(local.x, local.z).length()
+        });
+        candidates.push(PlateCandidate {
+            distance_squared: world.distance_squared(camera_pos),
+            world,
+            outpost_radius_m,
+        });
     }
 
-    best.map(|(_, world)| to_ros_vec3(world))
+    let world = match reference {
+        PlateReference::CenterNode => candidates
+            .iter()
+            .min_by(|a, b| a.distance_squared.total_cmp(&b.distance_squared))
+            .map(|candidate| candidate.world),
+        PlateReference::CenterNodeOrPlateRoot => select_outpost_plate_reference(&candidates),
+    }?;
+    Some(to_ros_vec3(world))
 }
 
 /// 把场景里的前哨站写进真值批次。
@@ -179,7 +252,7 @@ fn push_outpost_targets(
         if (batch.target_count as usize) >= GROUND_TRUTH_MAX_TARGETS {
             break;
         }
-        let Some((outpost_root, outpost)) = qq
+        let Some((_outpost_root, outpost)) = qq
             .child_of
             .iter_ancestors(rotor)
             .find_map(|ancestor| outpost_query.get(ancestor).ok())
@@ -194,7 +267,7 @@ fn push_outpost_targets(
         // 退回板根（见 `PlateReference::CenterNodeOrPlateRoot` 的实测依据）。
         let armor = camera_pos.and_then(|camera_pos| {
             select_plate_reference(
-                outpost_root,
+                rotor,
                 camera_pos,
                 PlateReference::CenterNodeOrPlateRoot,
                 qq,
@@ -664,6 +737,110 @@ mod tests {
         assert!(
             got_plate.distance(want_plate) < 1e-5,
             "应选中距相机最近的那块板 {want_plate:?}，实际 {got_plate:?}"
+        );
+    }
+
+    /// `OUTPOST_B_ROTATE/F_ARMOR_ROOT` 的水平半径约为正常板的 6.5 倍。即使它离相机
+    /// 最近，也不能把它当成自瞄板心真值；筛选依据必须是转轴局部几何，不是资产名字。
+    #[test]
+    fn outpost_radius_model_rejects_a_nearest_outlier_after_rotation() {
+        use crate::robomaster::prelude::{ArmorId, ArmorSpec, SmallArmorLabel};
+
+        const R: f32 = 0.275;
+        let rotor_at = Vec3::new(-3.06, 1.14, 2.21);
+        let rotor_rotation = Quat::from_rotation_y(67.0_f32.to_radians());
+        let normal_offsets = [
+            Vec3::new(R, -0.138, 0.0),
+            Vec3::new(-0.5 * R, -0.138, 0.866 * R),
+        ];
+        // F 的数字来自当前 OUTPOST.glb 的 B 组资产量级；特意不把节点名传给筛选逻辑。
+        let outlier_offset = Vec3::new(-0.151, 0.519, 1.777);
+
+        let mut world = World::new();
+        let (_root, rotor) = spawn_outpost(&mut world, Team::Blue, rotor_at, &[], 0);
+        *world.get_mut::<GlobalTransform>(rotor).unwrap() = GlobalTransform::from(
+            Transform::from_translation(rotor_at).with_rotation(rotor_rotation),
+        );
+
+        let armor = |name: &str| Armor {
+            name: name.to_string(),
+            team: Team::Blue,
+            spec: ArmorSpec::Small(SmallArmorLabel::Outpost),
+            label: ArmorLabel::Outpost,
+        };
+        let add_armor_root = |world: &mut World, id: usize, name: &str, offset: Vec3| {
+            let at = rotor_at + rotor_rotation * offset;
+            let entity = world
+                .spawn((
+                    armor(name),
+                    ArmorRoot {
+                        id: ArmorId::from_raw_for_test(id),
+                    },
+                    GlobalTransform::from_translation(at),
+                ))
+                .id();
+            world.entity_mut(rotor).add_child(entity);
+            (entity, at)
+        };
+        let (_, normal_a) = add_armor_root(&mut world, 10, "normal_a", normal_offsets[0]);
+        let (_, normal_b) = add_armor_root(&mut world, 11, "normal_b", normal_offsets[1]);
+        let (outlier, outlier_at) = add_armor_root(&mut world, 12, "outlier", outlier_offset);
+
+        // This mirrors the current AT/BT boundary: it is an Armor-named scene node but lacks a
+        // successfully constructed ArmorRoot, so the production `With<ArmorRoot>` query must not
+        // treat it as a plate candidate even when it is closest to the camera.
+        let missing_root = world
+            .spawn((
+                armor("AT_ARMOR_ROOT"),
+                GlobalTransform::from_translation(outlier_at),
+            ))
+            .id();
+        world.entity_mut(rotor).add_child(missing_root);
+        let armor_root_entities = world
+            .query_filtered::<Entity, With<ArmorRoot>>()
+            .iter(&world)
+            .collect::<Vec<_>>();
+        assert!(armor_root_entities.contains(&outlier));
+        assert!(
+            !armor_root_entities.contains(&missing_root),
+            "缺 ArmorRoot 的资产节点不得进入生产板位查询"
+        );
+
+        let camera_pos = outlier_at + Vec3::new(0.01, 0.0, 0.0);
+        assert!(
+            outlier_at.distance_squared(camera_pos)
+                < normal_a
+                    .distance_squared(camera_pos)
+                    .min(normal_b.distance_squared(camera_pos)),
+            "回归前提：异常 F 板必须是未过滤最近候选"
+        );
+        let expected = [normal_a, normal_b]
+            .into_iter()
+            .min_by(|a, b| {
+                a.distance_squared(camera_pos)
+                    .total_cmp(&b.distance_squared(camera_pos))
+            })
+            .unwrap();
+
+        let batch = collect_outposts(&mut world, Some(camera_pos));
+        assert_eq!(batch.target_count, 1);
+        let target = batch.targets[0];
+        assert_eq!(target.armor_position_valid, 1);
+        let selected = Vec3::from_array(target.armor_position);
+        assert!(
+            selected.distance(to_ros_vec3(expected)) < 1e-5,
+            "正常板仍应按最近策略选中：expected {:?}, actual {:?}",
+            to_ros_vec3(expected),
+            selected
+        );
+        assert!(
+            selected.distance(to_ros_vec3(outlier_at)) > 1.0,
+            "即使异常板最近，也不得发布它作为 armor_position"
+        );
+        let local_outlier = rotor_rotation.inverse() * (outlier_at - rotor_at);
+        assert!(
+            Vec2::new(local_outlier.x, local_outlier.z).length() > 6.0 * R,
+            "测试离群半径不足以代表当前资产缺陷"
         );
     }
 

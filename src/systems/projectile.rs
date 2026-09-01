@@ -40,7 +40,6 @@ pub fn projectile_launch(
     mut cooldown: ResMut<ProjectileCooldown>,
     mut stats: ResMut<ProjectileStatistics>,
     config: Res<SimulationConfig>,
-    _asset_server: Res<AssetServer>,
     mut commands: Commands,
     controller: Option<Res<ControllerState>>,
     mut rumble_requests: MessageWriter<GamepadRumbleRequest>,

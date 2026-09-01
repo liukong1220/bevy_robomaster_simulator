@@ -190,6 +190,25 @@ impl ShmPublisher {
         }
     }
 
+    /// Publish a control command into the command triple buffer.
+    ///
+    /// The simulator normally consumes this buffer through [`ShmSubscriber`].  Keeping the
+    /// producer here also lets an integration test drive that exact consumer path with an
+    /// isolated, named shared-memory region.
+    pub fn publish_gimbal_cmd(&mut self, command: GimbalCmd) {
+        unsafe {
+            let meta = self.meta_region.as_mut::<ShmMetaRegion>();
+            let mut producer = TripleBufferProducer::new(
+                &meta.gimbal_cmd.state,
+                &mut meta.gimbal_cmd.write_idx,
+                &mut meta.gimbal_cmd.slots,
+            );
+
+            *producer.borrow_mut() = command;
+            producer.publish();
+        }
+    }
+
     pub fn set_camera_info(&mut self, info: CameraInfo) {
         unsafe {
             let meta = self.meta_region.as_mut::<ShmMetaRegion>();

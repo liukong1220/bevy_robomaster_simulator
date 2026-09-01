@@ -1,5 +1,6 @@
 use bevy::input::mouse::MouseMotion;
 use bevy::prelude::*;
+use bevy::transform::helper::TransformHelper;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use core::f32::consts::PI;
 
@@ -21,19 +22,38 @@ pub fn following_controls(mut mode: ResMut<CameraMode>, controller: Res<Controll
 }
 
 pub fn update_camera_follow(
-    camera_query: Single<(&mut Transform, &MainCamera), Without<Controlled>>,
+    mut camera_queries: ParamSet<(
+        TransformHelper,
+        Query<(&mut Transform, &MainCamera), Without<Controlled>>,
+    )>,
     infantry: Single<&Transform, (With<Infantry>, With<Controlled>)>,
     gimbal: Single<&Transform, (With<Controlled>, With<InfantryGimbal>)>,
-    view_offset: Single<&GlobalTransform, (With<Controlled>, With<InfantryViewOffset>)>,
+    view_offset: Single<(Entity, &GlobalTransform), (With<Controlled>, With<InfantryViewOffset>)>,
     launch_offset: Single<&Transform, (With<Controlled>, With<InfantryLaunchOffset>)>,
-    gimbal_global: Single<&GlobalTransform, (With<Controlled>, With<InfantryGimbal>)>,
+    gimbal_global: Single<(Entity, &GlobalTransform), (With<Controlled>, With<InfantryGimbal>)>,
     mode: Res<CameraMode>,
     mut dbg_init: Local<bool>,
     mut dbg_left: Local<i32>,
 ) {
     let gimbal_transform = gimbal.into_inner();
-    let (mut camera_transform, camera_offset) = camera_query.into_inner();
-    let view_global = view_offset.into_inner();
+    let (view_entity, view_previous) = view_offset.into_inner();
+    // `Update` receives the current local input (chassis and external gimbal command), while
+    // Bevy's stored GlobalTransform is not propagated until PostUpdate.  Compute the current
+    // hierarchy now, write both camera Transforms, and let the normal propagation publish this
+    // exact pose to rendering and Talos later in the same frame.
+    let view_global = camera_queries
+        .p0()
+        .compute_global_transform(view_entity)
+        .unwrap_or(*view_previous);
+    let (gimbal_entity, gimbal_previous) = gimbal_global.into_inner();
+    let current_gimbal_global = camera_queries
+        .p0()
+        .compute_global_transform(gimbal_entity)
+        .unwrap_or(*gimbal_previous);
+    let mut cameras = camera_queries.p1();
+    let (mut camera_transform, camera_offset) = cameras
+        .single_mut()
+        .expect("MainCamera query must match exactly one entity");
 
     match mode.0 {
         FollowingType::Robot => {
@@ -45,11 +65,9 @@ pub fn update_camera_follow(
             // 渲染出来上下两半都是自己的装甲板，只中间留一条缝，视觉算法完全看
             // 不到别的车。用挂载点的 GlobalTransform 就没有这个系统性偏差。
             //
-            // 代价是 GlobalTransform 是上一帧 PostUpdate 传播的，机器人运动时相机
-            // 位置会滞后一帧；这比 0.2m 的固定偏差小得多，而且发布给算法的外参是
-            // 在 ExtractSchedule 里按真实 GlobalTransform 算的，两边仍然自洽。
-            // `CAM_DIRECTION` 的 GlobalTransform 是当前层级传播后的权威结果，确保
-            // VEHICLE 等中间节点的旋转也进入渲染相机。旧实现只拼
+            // `TransformHelper` 按本帧的完整层级计算 CAM_DIRECTION，随后本帧的正常
+            // PostUpdate 传播把同一姿态写回 GlobalTransform。这样不会再让运动底盘留下
+            // 一帧陈旧的渲染/IPC 姿态。旧实现只拼
             // `infantry * gimbal_local`，中间节点一旦带旋转就会让图像光轴与发布给
             // 算法的姿态分叉。
             camera_transform.translation = view_global.translation();
@@ -87,7 +105,7 @@ pub fn update_camera_follow(
                 if *dbg_left > 0 {
                     *dbg_left -= 1;
                     let cam_g = view_global;
-                    let gim_g = gimbal_global.into_inner();
+                    let gim_g = current_gimbal_global;
                     let q = |r: Quat| format!("[{:.5},{:.5},{:.5},{:.5}]", r.x, r.y, r.z, r.w);
                     info!(
                         "[camdbg] rendered_q={} launch_local_q={} gimbal_local_q={} infantry_q={} gimbal_global_q={} cam_global_q={} cam_pos={:?} gim_pos={:?}",

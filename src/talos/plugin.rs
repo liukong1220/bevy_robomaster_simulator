@@ -4,6 +4,7 @@ use crate::components::{
     Controlled, InfantryChassis, InfantryGimbal, InfantryLaunchOffset, SubscribeAutoAim,
 };
 use crate::config::SimulationConfig;
+use crate::systems::GameplaySystems;
 use crate::systems::projectile_launch;
 use crate::talos::capture::{
     TalosCaptureContext, TalosCapturePlugin, TalosFrameStamp, advance_talos_frame_stamp,
@@ -11,9 +12,10 @@ use crate::talos::capture::{
 };
 use crate::talos::link::{AutoAimLink, LinkState, LinkVerdict};
 use bevy::ecs::system::RunSystemOnce;
-use bevy::image::BevyDefault;
 use bevy::prelude::*;
 use bevy::render::render_resource::TextureFormat;
+use bevy::transform::TransformSystems;
+use bevy::transform::helper::TransformHelper;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,6 +26,12 @@ pub struct ShmSubscriberRes(pub Arc<Mutex<ShmSubscriber>>);
 
 #[derive(Resource, Deref, DerefMut)]
 pub struct TalosEnabled(pub AtomicBool);
+
+/// A command accepted during Update must launch only after this frame's hierarchy propagation.
+/// A bool is sufficient because the shared-memory consumer deliberately accepts at most the
+/// latest command once per frame.
+#[derive(Resource, Default)]
+struct ExternalFireRequest(bool);
 
 pub struct TalosPluginConfig {
     pub width: u32,
@@ -95,6 +103,27 @@ impl Plugin for TalosPlugin {
 
         app.insert_resource(TalosEnabled(AtomicBool::new(true)));
         app.init_resource::<AutoAimLink>();
+        app.init_resource::<ExternalFireRequest>();
+
+        // External commands must change local transforms before the single production
+        // TransformSystems::Propagate pass.  The former Last-stage placement was after that pass,
+        // so a rotating chassis left rendering, projectile launch and Talos poses one frame old.
+        app.add_systems(
+            Update,
+            (
+                advance_link_lease,
+                process_subscription
+                    .after(advance_link_lease)
+                    .run_if(|enabled: Res<SubscribeAutoAim>| enabled.load(Ordering::Acquire)),
+            )
+                .chain()
+                .after(GameplaySystems::Input)
+                .before(GameplaySystems::GameLogic),
+        );
+        app.add_systems(
+            PostUpdate,
+            launch_external_projectile.after(TransformSystems::Propagate),
+        );
         app.add_systems(Last, (advance_talos_frame_stamp, heartbeat_system));
         app.add_systems(
             Last,
@@ -107,15 +136,6 @@ impl Plugin for TalosPlugin {
             crate::talos::ground_truth::collect_ground_truth_system
                 .after(advance_talos_frame_stamp)
                 .after(publish_talos_runtime_state_system),
-        );
-        // 租约推进无条件每帧跑：没订阅、没命令的帧同样要让状态机前进，否则
-        // "对端断了"这件事只有等下一条命令到达才会被发现——而它可能永远不来。
-        app.add_systems(Last, advance_link_lease);
-        app.add_systems(
-            Last,
-            process_subscription
-                .after(advance_link_lease)
-                .run_if(|enabled: Res<SubscribeAutoAim>| enabled.load(Ordering::Acquire)),
         );
     }
 }
@@ -204,15 +224,10 @@ fn aim_gimbal_at(
     cmd_pitch_deg: f32,
     gimbal_transform: &mut Transform,
     gimbal_data: &mut InfantryGimbal,
-    gimbal_parent: Option<&ChildOf>,
-    parents: &Query<&GlobalTransform>,
+    parent_world: Quat,
     muzzle_world: Quat,
 ) {
     let target_world = world_aim_rotation(cmd_yaw_deg, cmd_pitch_deg);
-    let parent_world = gimbal_parent
-        .and_then(|child_of| parents.get(child_of.parent()).ok())
-        .map(|global| global.rotation())
-        .unwrap_or(Quat::IDENTITY);
     let local = gimbal_local_rotation(
         target_world,
         parent_world,
@@ -229,27 +244,27 @@ fn aim_gimbal_at(
 
 fn process_subscription(
     context: Option<Res<ShmSubscriberRes>>,
-    mut commands: Commands,
     time: Res<Time>,
     config: Res<SimulationConfig>,
     mut link: ResMut<AutoAimLink>,
-    gimbal: Single<
-        (&mut Transform, &mut InfantryGimbal, Option<&ChildOf>),
-        (
-            With<Controlled>,
-            Without<InfantryChassis>,
-            Without<InfantryLaunchOffset>,
-        ),
-    >,
-    parents: Query<&GlobalTransform>,
-    muzzle_offset: Single<&GlobalTransform, (With<InfantryLaunchOffset>, With<Controlled>)>,
+    mut transforms: ParamSet<(
+        TransformHelper,
+        Query<
+            (&mut Transform, &mut InfantryGimbal, Option<&ChildOf>),
+            (
+                With<Controlled>,
+                Without<InfantryChassis>,
+                Without<InfantryLaunchOffset>,
+            ),
+        >,
+        Query<(Entity, &GlobalTransform), (With<InfantryLaunchOffset>, With<Controlled>)>,
+    )>,
+    mut fire_request: ResMut<ExternalFireRequest>,
     mut fired: Local<u64>,
 ) {
     let Some(ctx) = context else {
         return;
     };
-    let (mut gimbal_transform, mut gimbal_data, gimbal_parent) = gimbal.into_inner();
-
     let Some(cmd) = recv_gimbal_cmd(&ctx) else {
         return;
     };
@@ -281,9 +296,10 @@ fn process_subscription(
     // 开火许可来自状态机，不来自 `fire_advice` 单独判断：租约外、被拒的命令一律
     // 到不了这里，而 `allows_fire()` 保证只有"接管中"才可能发弹。
     if fire && link.state().allows_fire() {
-        commands.queue(|w: &mut World| {
-            w.run_system_once(projectile_launch).unwrap();
-        });
+        // Do not run projectile_launch here: Update precedes TransformSystems::Propagate, so its
+        // GlobalTransform query would still describe the previous chassis pose.  The PostUpdate
+        // wrapper consumes this request after propagation.
+        fire_request.0 = true;
         // 发弹次数只存在 HUD 的 `ProjectileStatistics` 里。脚本化/无头跑闭环时
         // 没人能看 HUD，于是"外部火控到底有没有真的开火"在报告里只能靠视觉侧
         // 自己数的 fire 命令数去推断——而那个数只说明命令发出去了。这里按次数
@@ -299,15 +315,54 @@ fn process_subscription(
         }
     }
 
+    let parent_entity = {
+        let mut gimbals = transforms.p1();
+        let (_, _, gimbal_parent) = gimbals
+            .single_mut()
+            .expect("controlled gimbal query must match exactly one entity");
+        gimbal_parent.map(ChildOf::parent)
+    };
+    let (muzzle_entity, muzzle_previous) = {
+        let muzzles = transforms.p2();
+        let (entity, global) = muzzles
+            .single()
+            .expect("controlled muzzle query must match exactly one entity");
+        (entity, *global)
+    };
+    let helper = transforms.p0();
+    let parent_world = parent_entity
+        .and_then(|entity| helper.compute_global_transform(entity).ok())
+        .map(|global| global.rotation())
+        .unwrap_or(Quat::IDENTITY);
+    let muzzle_world = helper
+        .compute_global_transform(muzzle_entity)
+        .unwrap_or(muzzle_previous)
+        .rotation();
+    let mut gimbals = transforms.p1();
+    let (mut gimbal_transform, mut gimbal_data, _) = gimbals
+        .single_mut()
+        .expect("controlled gimbal query must match exactly one entity");
+
     aim_gimbal_at(
         cmd.yaw_deg,
         cmd.pitch_deg,
         &mut gimbal_transform,
         &mut gimbal_data,
-        gimbal_parent,
-        &parents,
-        muzzle_offset.rotation(),
+        parent_world,
+        muzzle_world,
     );
+}
+
+fn launch_external_projectile(
+    mut fire_request: ResMut<ExternalFireRequest>,
+    mut commands: Commands,
+) {
+    if !std::mem::take(&mut fire_request.0) {
+        return;
+    }
+    commands.queue(|world: &mut World| {
+        world.run_system_once(projectile_launch).unwrap();
+    });
 }
 
 fn heartbeat_system(context: Option<Res<TalosCaptureContext>>) {
@@ -364,10 +419,22 @@ pub fn to_ros_quat(quat: Quat) -> Quat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::components::{CameraMode, FollowingType, Infantry, InfantryViewOffset, MainCamera};
+    use crate::capture::{CaptureCamera, CaptureSource, sync_capture_camera};
+    use crate::components::{
+        CameraMode, FollowingType, Infantry, InfantryViewOffset, MainCamera, ProjectileCooldown,
+        ProjectileSetting,
+    };
+    use crate::config::SimulationConfig;
+    use crate::robomaster::prelude::Projectile;
     use crate::robomaster::prelude::{INFANTRY_THREE_CONFIG, Team};
-    use crate::systems::update_camera_follow;
-    use bevy::transform::{TransformPlugin, TransformSystems};
+    use crate::statistic::ProjectileStatistics;
+    use crate::systems::{ChassisObservationFrame, update_camera_follow};
+    use crate::talos::capture::{captured_pose_data, publish_pose_data};
+    use avian3d::prelude::{AngularVelocity, LinearVelocity};
+    use bevy::input::gamepad::GamepadRumbleRequest;
+    use bevy::transform::TransformPlugin;
+    use std::sync::atomic::AtomicU64;
+    use talos_ipc::{GimbalCmd, PoseIndex, PoseMeta, ShmPublisher, ShmSubscriber};
 
     /// SHOT_DIRECTION / CAM_DIRECTION 相对 GIMBAL 的固定安装角。真实场景里是绕局部
     /// X 轴 -65°（见 `systems/camera.rs` 里那段说明），这里照抄，好让"安装角非零"
@@ -388,26 +455,53 @@ mod tests {
     fn aim_from_resource(
         cmd: Res<AimCmd>,
         mut runs: ResMut<AimRuns>,
-        gimbal: Single<
-            (&mut Transform, &mut InfantryGimbal, Option<&ChildOf>),
-            (
-                With<Controlled>,
-                Without<InfantryChassis>,
-                Without<InfantryLaunchOffset>,
-            ),
-        >,
-        parents: Query<&GlobalTransform>,
-        muzzle_offset: Single<&GlobalTransform, (With<InfantryLaunchOffset>, With<Controlled>)>,
+        mut transforms: ParamSet<(
+            TransformHelper,
+            Query<
+                (&mut Transform, &mut InfantryGimbal, Option<&ChildOf>),
+                (
+                    With<Controlled>,
+                    Without<InfantryChassis>,
+                    Without<InfantryLaunchOffset>,
+                ),
+            >,
+            Query<(Entity, &GlobalTransform), (With<InfantryLaunchOffset>, With<Controlled>)>,
+        )>,
     ) {
-        let (mut gimbal_transform, mut gimbal_data, gimbal_parent) = gimbal.into_inner();
+        let parent_entity = {
+            let mut gimbals = transforms.p1();
+            let (_, _, gimbal_parent) = gimbals
+                .single_mut()
+                .expect("controlled gimbal query must match exactly one entity");
+            gimbal_parent.map(ChildOf::parent)
+        };
+        let (muzzle_entity, muzzle_previous) = {
+            let muzzles = transforms.p2();
+            let (entity, global) = muzzles
+                .single()
+                .expect("controlled muzzle query must match exactly one entity");
+            (entity, *global)
+        };
+        let helper = transforms.p0();
+        let parent_world = parent_entity
+            .and_then(|entity| helper.compute_global_transform(entity).ok())
+            .map(|global| global.rotation())
+            .unwrap_or(Quat::IDENTITY);
+        let muzzle_world = helper
+            .compute_global_transform(muzzle_entity)
+            .unwrap_or(muzzle_previous)
+            .rotation();
+        let mut gimbals = transforms.p1();
+        let (mut gimbal_transform, mut gimbal_data, _) = gimbals
+            .single_mut()
+            .expect("controlled gimbal query must match exactly one entity");
         aim_gimbal_at(
             cmd.yaw_deg,
             cmd.pitch_deg,
             &mut gimbal_transform,
             &mut gimbal_data,
-            gimbal_parent,
-            &parents,
-            muzzle_offset.rotation(),
+            parent_world,
+            muzzle_world,
         );
         runs.0 += 1;
     }
@@ -436,12 +530,9 @@ mod tests {
             app.insert_resource(cmd);
             app.init_resource::<AimRuns>();
             app.insert_resource(CameraMode(FollowingType::Robot));
-            app.add_systems(Update, aim_from_resource);
-            // 相机跟随是生产代码，放在本帧传播之后，才能拿到刚写下去的云台姿态。
-            app.add_systems(
-                PostUpdate,
-                update_camera_follow.after(TransformSystems::Propagate),
-            );
+            // 与生产调度一样：命令和相机都在 Update 写本地 Transform，随后由
+            // PostUpdate 的 TransformSystems::Propagate 一次性发布当前帧世界姿态。
+            app.add_systems(Update, (aim_from_resource, update_camera_follow).chain());
 
             let mount = Quat::from_euler(EulerRot::YXZ, 0.0, MOUNT_PITCH_DEG.to_radians(), 0.0);
             let world = app.world_mut();
@@ -602,6 +693,487 @@ mod tests {
         yaw_deg: 40.0,
         pitch_deg: -12.0,
     };
+
+    #[derive(Resource)]
+    struct TestChassisYaw {
+        entity: Entity,
+        yaw_rad: f32,
+        yaw_rate_radps: f32,
+    }
+
+    #[derive(Resource, Default)]
+    struct TestPoseFrame(u64);
+
+    #[derive(Resource, Clone)]
+    struct TestPosePublisher(Arc<Mutex<ShmPublisher>>);
+
+    /// This test's Update-input stand-in rotates the chassis before the real Talos command
+    /// consumer, matching the phase where production vehicle input changes its local Transform.
+    fn drive_test_chassis(
+        mut drive: ResMut<TestChassisYaw>,
+        mut transforms: Query<&mut Transform>,
+    ) {
+        drive.yaw_rad += drive.yaw_rate_radps / 60.0;
+        let mut chassis = transforms
+            .get_mut(drive.entity)
+            .expect("test chassis entity disappeared");
+        chassis.rotation = Quat::from_rotation_y(drive.yaw_rad);
+    }
+
+    fn advance_test_pose_frame(mut frame: ResMut<TestPoseFrame>) {
+        frame.0 += 1;
+    }
+
+    /// Uses the production serializer and actual Talos triple buffers.  It runs in Last, after
+    /// Update input/command/camera and PostUpdate propagation, just before ExtractSchedule would
+    /// read these GlobalTransforms in the real simulator.
+    fn publish_test_pose_snapshot(
+        publisher: Res<TestPosePublisher>,
+        frame: Res<TestPoseFrame>,
+        camera: Single<&GlobalTransform, With<CaptureSource>>,
+        gimbal: Single<&GlobalTransform, (With<Controlled>, With<InfantryGimbal>)>,
+        muzzle: Single<
+            (&GlobalTransform, &Transform),
+            (With<Controlled>, With<InfantryLaunchOffset>),
+        >,
+        chassis: Res<ChassisObservationFrame>,
+    ) {
+        let (muzzle_global, muzzle_local) = muzzle.into_inner();
+        let pose = captured_pose_data(
+            camera.into_inner(),
+            gimbal.into_inner(),
+            muzzle_global,
+            muzzle_local,
+            &chassis,
+            frame.0,
+            10_000_000_000 + frame.0,
+        );
+        let mut publisher = publisher.0.lock().expect("test pose publisher poisoned");
+        publish_pose_data(&mut publisher, frame.0, 10_000_000_000 + frame.0, &pose);
+    }
+
+    struct ProductionScheduleRig {
+        app: App,
+        command_publisher: Arc<Mutex<ShmPublisher>>,
+        pose_reader: ShmSubscriber,
+        view: Entity,
+        gimbal: Entity,
+        muzzle: Entity,
+        camera: Entity,
+        capture_camera: Entity,
+    }
+
+    impl ProductionScheduleRig {
+        fn new() -> Self {
+            static TEST_IPC_ID: AtomicU64 = AtomicU64::new(0);
+
+            let id = TEST_IPC_ID.fetch_add(1, Ordering::Relaxed);
+            let prefix = format!("talos_schedule_{}_{}", std::process::id(), id);
+            let meta_name = format!("{prefix}_meta");
+            let image_name = format!("{prefix}_image");
+            let command_publisher = Arc::new(Mutex::new(
+                ShmPublisher::create_named(&meta_name, &image_name)
+                    .expect("create isolated Talos publisher"),
+            ));
+            let command_subscriber = ShmSubscriber::connect_named(&meta_name)
+                .expect("connect isolated Talos command subscriber");
+            let pose_reader = ShmSubscriber::connect_named(&meta_name)
+                .expect("connect isolated Talos pose reader");
+
+            let mut app = App::new();
+            app.add_plugins((MinimalPlugins, TransformPlugin));
+            app.insert_resource(SimulationConfig::default());
+            app.insert_resource(SubscribeAutoAim(AtomicBool::new(true)));
+            app.init_resource::<AutoAimLink>();
+            app.init_resource::<ExternalFireRequest>();
+            app.insert_resource(ProjectileCooldown(Timer::from_seconds(
+                0.0,
+                TimerMode::Once,
+            )));
+            app.init_resource::<ProjectileStatistics>();
+            app.insert_resource(ProjectileSetting(Handle::default(), Handle::default()));
+            app.init_resource::<ChassisObservationFrame>();
+            app.init_resource::<TestPoseFrame>();
+            app.insert_resource(TestPosePublisher(command_publisher.clone()));
+            app.insert_resource(ShmSubscriberRes(Arc::new(Mutex::new(command_subscriber))));
+            app.add_message::<GamepadRumbleRequest>();
+            app.insert_resource(CameraMode(FollowingType::Robot));
+
+            let world = app.world_mut();
+            let root = world
+                .spawn((
+                    Infantry::new(Team::Blue, INFANTRY_THREE_CONFIG),
+                    Controlled,
+                    Transform::from_xyz(3.5, 0.0, 1.0),
+                    LinearVelocity::default(),
+                    AngularVelocity::default(),
+                ))
+                .id();
+            let vehicle = world
+                .spawn((
+                    Controlled,
+                    Transform::from_xyz(0.0, 0.08, 0.0)
+                        .with_rotation(Quat::from_rotation_y(17.0_f32.to_radians())),
+                    ChildOf(root),
+                ))
+                .id();
+            let gimbal = world
+                .spawn((
+                    Controlled,
+                    InfantryGimbal::default(),
+                    Transform::from_xyz(0.0, 0.21, 0.0),
+                    ChildOf(vehicle),
+                ))
+                .id();
+            let mount = Quat::from_euler(EulerRot::YXZ, 0.0, MOUNT_PITCH_DEG.to_radians(), 0.0);
+            let muzzle = world
+                .spawn((
+                    Controlled,
+                    InfantryLaunchOffset,
+                    Transform::from_xyz(0.05, 0.0, 0.11).with_rotation(mount),
+                    ChildOf(gimbal),
+                ))
+                .id();
+            let view = world
+                .spawn((
+                    Controlled,
+                    InfantryViewOffset,
+                    Transform::from_xyz(0.0, 0.05, 0.12).with_rotation(mount),
+                    ChildOf(gimbal),
+                ))
+                .id();
+            let camera = world
+                .spawn((
+                    MainCamera {
+                        follow_offset: Vec3::new(0.0, 2.0, 5.0),
+                    },
+                    CaptureSource,
+                    Transform::default(),
+                ))
+                .id();
+            let capture_camera = world.spawn((CaptureCamera, Transform::default())).id();
+
+            app.insert_resource(TestChassisYaw {
+                entity: root,
+                yaw_rad: 0.0,
+                yaw_rate_radps: 0.0,
+            });
+            // Production order: input changes chassis -> accepted Talos command changes gimbal ->
+            // camera copies current CAM_DIRECTION -> PostUpdate propagates -> external fire
+            // request runs projectile_launch -> Last snapshots poses for ExtractSchedule/IPC.
+            app.add_systems(Update, drive_test_chassis);
+            app.add_systems(
+                Update,
+                (
+                    advance_link_lease,
+                    process_subscription
+                        .after(advance_link_lease)
+                        .run_if(|enabled: Res<SubscribeAutoAim>| enabled.load(Ordering::Acquire)),
+                )
+                    .chain()
+                    .after(drive_test_chassis),
+            );
+            app.add_systems(
+                Update,
+                (update_camera_follow, sync_capture_camera)
+                    .chain()
+                    .after(process_subscription),
+            );
+            app.add_systems(
+                PostUpdate,
+                launch_external_projectile.after(TransformSystems::Propagate),
+            );
+            app.add_systems(
+                Last,
+                (advance_test_pose_frame, publish_test_pose_snapshot).chain(),
+            );
+
+            Self {
+                app,
+                command_publisher,
+                pose_reader,
+                view,
+                gimbal,
+                muzzle,
+                camera,
+                capture_camera,
+            }
+        }
+
+        fn set_chassis_motion(&mut self, yaw_deg: f32, yaw_rate_radps: f32) {
+            let mut drive = self.app.world_mut().resource_mut::<TestChassisYaw>();
+            drive.yaw_rad = yaw_deg.to_radians();
+            drive.yaw_rate_radps = yaw_rate_radps;
+        }
+
+        fn publish_world_command(&self) {
+            let timestamp_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time before UNIX epoch")
+                .as_nanos() as u64;
+            self.command_publisher
+                .lock()
+                .expect("test command publisher poisoned")
+                .publish_gimbal_cmd(GimbalCmd {
+                    timestamp_ns,
+                    yaw_deg: CMD.yaw_deg,
+                    pitch_deg: CMD.pitch_deg,
+                    distance_m: 5.0,
+                    fire_advice: 1,
+                    _pad: [0; 11],
+                });
+        }
+
+        fn step(&mut self) -> (u64, PoseMeta, PoseMeta, PoseMeta, PoseMeta) {
+            let expected_frame = self.app.world().resource::<TestPoseFrame>().0 + 1;
+            self.publish_world_command();
+            self.app.update();
+            let gimbal = self
+                .pose_reader
+                .recv_pose(PoseIndex::Gimbal)
+                .expect("gimbal IPC pose missing");
+            let odom = self
+                .pose_reader
+                .recv_pose(PoseIndex::Odom)
+                .expect("odom IPC pose missing");
+            let muzzle = self
+                .pose_reader
+                .recv_pose(PoseIndex::Muzzle)
+                .expect("muzzle IPC pose missing");
+            let camera = self
+                .pose_reader
+                .recv_pose(PoseIndex::Camera)
+                .expect("camera IPC pose missing");
+            (expected_frame, gimbal, odom, muzzle, camera)
+        }
+
+        fn world_transform(&self, entity: Entity) -> Transform {
+            self.app
+                .world()
+                .get::<GlobalTransform>(entity)
+                .expect("test transform missing")
+                .compute_transform()
+        }
+
+        fn projectile_direction(&mut self) -> Vec3 {
+            let world = self.app.world_mut();
+            let mut projectiles = world.query_filtered::<&LinearVelocity, With<Projectile>>();
+            projectiles
+                .iter(world)
+                .last()
+                .expect("PostUpdate projectile_launch did not spawn a projectile")
+                .0
+                .normalize()
+        }
+    }
+
+    #[derive(Default)]
+    struct AngleMetrics {
+        samples: usize,
+        total_deg: f32,
+        max_deg: f32,
+    }
+
+    impl AngleMetrics {
+        fn observe(&mut self, deg: f32) {
+            self.samples += 1;
+            self.total_deg += deg;
+            self.max_deg = self.max_deg.max(deg);
+        }
+
+        fn mean_deg(&self) -> f32 {
+            self.total_deg / self.samples.max(1) as f32
+        }
+    }
+
+    fn assert_vec3_near(actual: Vec3, expected: Vec3, tolerance: f32, what: &str) {
+        let error = actual.distance(expected);
+        assert!(
+            error < tolerance,
+            "{what}: actual={actual:?} expected={expected:?} error={error:.7}m"
+        );
+    }
+
+    fn assert_quat_near(actual: Quat, expected: Quat, tolerance_deg: f32, what: &str) -> f32 {
+        let error = quat_angle_deg(actual, expected);
+        assert!(
+            error < tolerance_deg,
+            "{what}: orientation error={error:.6} deg"
+        );
+        error
+    }
+
+    /// Drives the actual production Talos command system through static chassis yaw 0/30/90 and
+    /// then 3 rad/s continuous rotation.  Every sample crosses the real Update -> PostUpdate ->
+    /// Last schedule and checks propagated mount entities, rendering/capture cameras, a spawned
+    /// projectile and isolated Talos IPC pose channels.
+    #[test]
+    fn production_schedule_keeps_dynamic_chassis_camera_projectile_and_ipc_in_same_frame() {
+        const TOLERANCE_DEG: f32 = 0.03;
+        const TOLERANCE_M: f32 = 1e-4;
+        const CONTINUOUS_RATE_RADPS: f32 = 3.0;
+        const CONTINUOUS_FRAMES: usize = 60;
+
+        let expected_direction = expected_world_dir(CMD.yaw_deg, CMD.pitch_deg);
+        let camera_roll = Quat::from_euler(EulerRot::ZYX, 0.0, 0.0, std::f32::consts::FRAC_PI_2);
+        let mut rig = ProductionScheduleRig::new();
+        let mut shot_error = AngleMetrics::default();
+        let mut rendered_camera_error = AngleMetrics::default();
+        let mut projectile_error = AngleMetrics::default();
+        let mut ipc_orientation_error = AngleMetrics::default();
+
+        let mut validate = |rig: &mut ProductionScheduleRig, phase: &str| {
+            let (frame, gimbal_ipc, odom_ipc, muzzle_ipc, camera_ipc) = rig.step();
+            for (name, pose) in [
+                ("gimbal", gimbal_ipc),
+                ("odom", odom_ipc),
+                ("muzzle", muzzle_ipc),
+                ("camera", camera_ipc),
+            ] {
+                assert_eq!(
+                    pose.frame_seq, frame,
+                    "{phase}: {name} IPC frame_seq must equal Last snapshot frame {frame}"
+                );
+                assert_eq!(
+                    pose.timestamp_ns,
+                    10_000_000_000 + frame,
+                    "{phase}: {name} IPC timestamp must come from the same Last snapshot"
+                );
+            }
+
+            let shot = rig.world_transform(rig.muzzle);
+            let cam_direction = rig.world_transform(rig.view);
+            let rendered_camera = rig.world_transform(rig.camera);
+            let capture_camera = rig.world_transform(rig.capture_camera);
+            let gimbal = rig.world_transform(rig.gimbal);
+            let projectile_direction = rig.projectile_direction();
+
+            let shot_dir = shot.rotation.mul_vec3(Vec3::Y).normalize();
+            let rendered_forward = rendered_camera.rotation.mul_vec3(Vec3::NEG_Z).normalize();
+            shot_error.observe(vec_angle_deg(shot_dir, expected_direction));
+            rendered_camera_error.observe(vec_angle_deg(rendered_forward, shot_dir));
+            projectile_error.observe(vec_angle_deg(projectile_direction, shot_dir));
+            assert_dir(
+                shot_dir,
+                expected_direction,
+                TOLERANCE_DEG,
+                &format!("{phase} SHOT_DIRECTION"),
+            );
+            assert_dir(
+                rendered_forward,
+                shot_dir,
+                TOLERANCE_DEG,
+                &format!("{phase} rendered camera forward"),
+            );
+            assert_dir(
+                projectile_direction,
+                shot_dir,
+                TOLERANCE_DEG,
+                &format!("{phase} projectile_launch direction"),
+            );
+            assert_vec3_near(
+                rendered_camera.translation,
+                cam_direction.translation,
+                TOLERANCE_M,
+                &format!("{phase} rendered camera position vs CAM_DIRECTION"),
+            );
+            assert_quat_near(
+                rendered_camera.rotation,
+                cam_direction.rotation * camera_roll,
+                TOLERANCE_DEG,
+                &format!("{phase} rendered camera rotation vs CAM_DIRECTION"),
+            );
+            assert_vec3_near(
+                capture_camera.translation,
+                rendered_camera.translation,
+                TOLERANCE_M,
+                &format!("{phase} capture camera position"),
+            );
+            assert_quat_near(
+                capture_camera.rotation,
+                rendered_camera.rotation,
+                TOLERANCE_DEG,
+                &format!("{phase} capture camera rotation"),
+            );
+
+            let expected_ipc_quat = to_ros_quat(shot.rotation * camera_roll);
+            let gimbal_quat = Quat::from_xyzw(
+                gimbal_ipc.quaternion[1],
+                gimbal_ipc.quaternion[2],
+                gimbal_ipc.quaternion[3],
+                gimbal_ipc.quaternion[0],
+            );
+            ipc_orientation_error.observe(assert_quat_near(
+                gimbal_quat,
+                expected_ipc_quat,
+                TOLERANCE_DEG,
+                &format!("{phase} Talos Gimbal quaternion"),
+            ));
+            assert_vec3_near(
+                Vec3::from_array(odom_ipc.position),
+                to_ros_translation(gimbal.translation),
+                TOLERANCE_M,
+                &format!("{phase} Talos Odom/gimbal pivot position"),
+            );
+            assert_vec3_near(
+                Vec3::from_array(muzzle_ipc.position),
+                to_ros_translation(shot.translation),
+                TOLERANCE_M,
+                &format!("{phase} Talos Muzzle world position"),
+            );
+            let muzzle_quat = Quat::from_xyzw(
+                muzzle_ipc.quaternion[1],
+                muzzle_ipc.quaternion[2],
+                muzzle_ipc.quaternion[3],
+                muzzle_ipc.quaternion[0],
+            );
+            assert_quat_near(
+                muzzle_quat,
+                expected_ipc_quat,
+                TOLERANCE_DEG,
+                &format!("{phase} Talos Muzzle quaternion"),
+            );
+            let camera_relative = GlobalTransform::from(rendered_camera)
+                .reparented_to(&GlobalTransform::from(gimbal))
+                .translation;
+            assert_vec3_near(
+                Vec3::from_array(camera_ipc.position),
+                to_ros_translation(camera_relative),
+                TOLERANCE_M,
+                &format!("{phase} Talos Camera relative position"),
+            );
+            assert_eq!(camera_ipc.quaternion, [1.0, 0.0, 0.0, 0.0]);
+        };
+
+        for yaw_deg in CHASSIS_YAWS {
+            rig.set_chassis_motion(yaw_deg, 0.0);
+            validate(&mut rig, &format!("static yaw={yaw_deg:.0}deg"));
+        }
+        rig.set_chassis_motion(90.0, CONTINUOUS_RATE_RADPS);
+        for frame in 0..CONTINUOUS_FRAMES {
+            validate(&mut rig, &format!("continuous frame={frame}"));
+        }
+
+        println!(
+            "[talos-schedule] phase=Update[drive,input,command,camera] -> PostUpdate[TransformSystems::Propagate,projectile_launch] -> Last[pose_snapshot]; samples={}; static_yaw_deg=[0,30,90]; continuous_rate_radps={CONTINUOUS_RATE_RADPS:.3}; frame_dt_s={:.7}; legacy_one_frame_lag_rad={:.6}; legacy_one_frame_lag_deg={:.4}; shot(max/mean)={:.6}/{:.6}deg; rendered_camera(max/mean)={:.6}/{:.6}deg; projectile(max/mean)={:.6}/{:.6}deg; ipc_orientation(max/mean)={:.6}/{:.6}deg",
+            shot_error.samples,
+            1.0 / 60.0,
+            CONTINUOUS_RATE_RADPS / 60.0,
+            (CONTINUOUS_RATE_RADPS / 60.0).to_degrees(),
+            shot_error.max_deg,
+            shot_error.mean_deg(),
+            rendered_camera_error.max_deg,
+            rendered_camera_error.mean_deg(),
+            projectile_error.max_deg,
+            projectile_error.mean_deg(),
+            ipc_orientation_error.max_deg,
+            ipc_orientation_error.mean_deg(),
+        );
+        assert!(shot_error.max_deg < TOLERANCE_DEG);
+        assert!(rendered_camera_error.max_deg < TOLERANCE_DEG);
+        assert!(projectile_error.max_deg < TOLERANCE_DEG);
+        assert!(ipc_orientation_error.max_deg < TOLERANCE_DEG);
+    }
 
     #[test]
     fn a_world_frame_command_aims_the_muzzle_the_same_way_at_any_chassis_yaw() {

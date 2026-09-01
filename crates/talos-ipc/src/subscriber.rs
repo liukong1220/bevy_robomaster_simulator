@@ -8,7 +8,15 @@ pub struct ShmSubscriber {
 
 impl ShmSubscriber {
     pub fn connect() -> Result<Self, ShmError> {
-        let meta_region = ShmRegion::open(SHM_NAME_META, size_of::<ShmMetaRegion>())?;
+        Self::connect_named(SHM_NAME_META)
+    }
+
+    /// Connect to an explicit metadata region.
+    ///
+    /// Production code uses [`Self::connect`] and the fixed protocol name.  Isolated tests use
+    /// this constructor so they never replace a running simulator's shared-memory region.
+    pub fn connect_named(meta_name: &str) -> Result<Self, ShmError> {
+        let meta_region = ShmRegion::open(meta_name, size_of::<ShmMetaRegion>())?;
 
         unsafe {
             let meta = meta_region.as_ref::<ShmMetaRegion>();
@@ -31,6 +39,18 @@ impl ShmSubscriber {
                 &mut meta.gimbal_cmd.read_idx,
                 &meta.gimbal_cmd.slots,
             );
+
+            consumer.borrow().copied()
+        }
+    }
+
+    /// Consume the latest pose sample from a protocol pose channel.
+    pub fn recv_pose(&mut self, index: PoseIndex) -> Option<PoseMeta> {
+        unsafe {
+            let meta = self.meta_region.as_mut::<ShmMetaRegion>();
+            let pose = &mut meta.poses[index as usize];
+            let mut consumer =
+                TripleBufferConsumer::new(&pose.state, &mut pose.read_idx, &pose.slots);
 
             consumer.borrow().copied()
         }
