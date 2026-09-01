@@ -4,32 +4,13 @@ use crate::robomaster::prelude::{
     Activation, Armor, ArmorRoot, MechanismState, PowerRune, PowerRuneMechanism, PowerRuneRotation,
     RuneMode, Team,
 };
-use crate::talos::capture::{NO_PUBLISHED_IMAGE, TalosCaptureContext, TalosFrameStamp};
+use crate::talos::capture::{TalosCaptureContext, TalosFrameStamp, TalosGroundTruthFrame};
 use crate::talos::plugin::M_ALIGN_MAT3;
 use crate::util::entity_query::HierarchyQuery;
 use avian3d::prelude::AngularVelocity;
 use bevy::prelude::*;
-use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::Ordering;
+use std::collections::HashMap;
 use talos_ipc::*;
-
-/// 真值历史深度。图像要等 GPU 回读才进共享内存，比这里的当前帧晚若干帧；
-/// 深度不够时"已发布图像的同帧真值"会被挤掉，评估直接少样本。单条
-/// GroundTruthBatch 1664 字节，64 帧约 106KB，代价可以忽略，所以留足余量。
-/// 真的不够时下面会打 warn 而不是静默丢弃。
-///
-/// 实测：这个深度**不是**评估丢样本的原因，不要为了消除下面那条 warn 去加大它。
-///   深度 64  -> seq_mismatches 占 frames_ok 的 10~17%
-///   深度 256 -> 13.6%（60s，485 帧），没有改善
-/// 真正的成因是发布时序差一拍：消费侧新增的 seq_skew 统计给出 min=-1 max=+2
-/// mean=+0.88 帧，即真值与图像基本同帧、只差一个发布节拍，而不是"旧了几十帧被
-/// 挤掉"（那样 skew 会是很大的负数）。要修得动发布端的提交顺序，属于协议时序
-/// 改动，本次不做，只把可观测量补齐。
-///
-/// 另外那条溢出 warn 本身也会误导：history 每个 Bevy 帧都 push，而只有图像落地
-/// (约 8fps) 才会推进水位并修剪，所以稳态下必然持续淘汰（实测 ~7~10 次/s，
-/// 有无消费者都一样）。它是结构性的正常现象，不是故障。
-const GT_HISTORY_DEPTH: usize = 64;
 
 fn to_ros_vec3(v: Vec3) -> Vec3 {
     M_ALIGN_MAT3 * v
@@ -111,12 +92,19 @@ fn select_armor_center(
         // 板心节点。ros2/plugin.rs 用的是同一条路径（"CENTER" 后缀节点的子节点），
         // 但那边直接 unwrap；这里任何一步取不到就跳过这块板，不能让真值发布
         // 因为场景资产换了个节点名就 panic 掉整个仿真。
-        let center = qq
+        // `?` 在这里是错的：它会从整个函数返回 None，把已经选出来的 best 一起丢掉。
+        // 一块板缺 CENTER（资产换了节点名、或该板的子树还没加载完）就会让整车的板心
+        // 真值全部消失，消费端只能退回整车中心，误差里凭空多出 2 度量级的几何偏差。
+        // 缺板必须只跳过这一块板。
+        let Some(center) = qq
             .of(plate)
             .suffix("CENTER")
             .any()
             .one()
-            .or_else(|| qq.of(plate).suffix("CENTER").one())?;
+            .or_else(|| qq.of(plate).suffix("CENTER").one())
+        else {
+            continue;
+        };
         let Ok(center_tf) = transforms.get(center) else {
             continue;
         };
@@ -131,12 +119,20 @@ fn select_armor_center(
     best.map(|(_, world)| to_ros_vec3(world))
 }
 
-pub fn publish_ground_truth_system(
+/// 采集本帧真值，写进 [`TalosGroundTruthFrame`]，**不**自己发布。
+///
+/// 发布由图像那一侧的事务完成（`TalosSnapshot::captured` 的 `before_commit` 回调），
+/// 这样图像、同帧姿态、同帧真值三者的 `frame_seq` 严格相等。见
+/// [`TalosGroundTruthFrame`] 的说明，以及它替换掉的那套"真值历史 + 按已发布图像
+/// 帧号回放"的做法为什么做不到同帧。
+///
+/// 本系统必须排在 `advance_talos_frame_stamp` 之后、且与紧随主世界的
+/// ExtractSchedule 同一帧内，否则 `extract_pose_data` 的帧号一致性检查会把这一批
+/// 真值丢掉（宁可少样本，也不能发错帧的真值）。
+pub fn collect_ground_truth_system(
     context: Option<Res<TalosCaptureContext>>,
     frame_stamp: Res<TalosFrameStamp>,
-    mut history: Local<VecDeque<GroundTruthBatch>>,
-    mut last_published_seq: Local<Option<u64>>,
-    mut evicted_batches: Local<u64>,
+    mut out: ResMut<TalosGroundTruthFrame>,
     infantry_query: Query<
         (
             Entity,
@@ -167,9 +163,12 @@ pub fn publish_ground_truth_system(
         &PowerRuneRotation,
     )>,
 ) {
-    let Some(ctx) = context else {
+    // 没有采集上下文就没有图像事务，真值也无处提交。清掉上一帧的残留，
+    // 免得它被误当成本帧的数据。
+    if context.is_none() {
+        out.batch = None;
         return;
-    };
+    }
 
     let frame_seq = frame_stamp.frame_seq;
     let timestamp_ns = frame_stamp.timestamp_ns;
@@ -290,184 +289,99 @@ pub fn publish_ground_truth_system(
         batch.rune_count += 1;
     }
 
-    // 攒一段历史，只发布"与已落地图像同帧"的那一批。
+    // 交给图像事务去发布。这里只放下"本帧的真值 + 它属于哪一帧"，
+    // `extract_pose_data` 会核对帧号后带进快照。
     //
-    // 直接发当前帧的真值是错的：图像要等 GPU 回读，实测比这里晚约 2 帧，等它进
-    // 共享内存时真值槽位早被后两帧覆盖了。消费侧 GroundTruthEvaluator::fetch()
-    // 要求 gt.frame_seq == image.frame_seq（这是对的，评估必须同帧），于是恒不
-    // 命中，--eval 一个样本都取不到。这里改成按图像实际发布进度回放真值，
-    // 共享内存布局和 ABI 版本都不用动。
-    //
-    // 真值只流向评估器，不进算法输入，这条边界不变。
-    history.push_back(batch);
-    while history.len() > GT_HISTORY_DEPTH {
-        // 被挤掉的批次里可能就有下一次要匹配的那一帧。这里计数并按指数间隔告警，
-        // 否则历史深度不够只会表现为"评估样本莫名变少"，很难查。
-        history.pop_front();
-        *evicted_batches += 1;
-        if evicted_batches.is_power_of_two() {
-            // 降级成 debug：稳态下必然持续淘汰（push 每 Bevy 帧、修剪只在图像
-            // 落地时，约 8fps），warn 会让人以为是故障并去加大深度——实测加到
-            // 256 对 seq_mismatches 没有任何改善（见 GT_HISTORY_DEPTH 的说明）。
-            debug!(
-                "真值历史淘汰 {} 次 (深度 {})：稳态下正常。评估少样本请看消费侧 \
-                 seq_skew（差一拍是发布时序，负得很大才是深度不够）",
-                *evicted_batches, GT_HISTORY_DEPTH
-            );
-        }
-    }
-
-    let published_seq = ctx.published_image_seq.load(Ordering::Acquire);
-    match select_ground_truth(&mut history, *last_published_seq, published_seq) {
-        GtSelection::Wait => {}
-        GtSelection::Skip => *last_published_seq = Some(published_seq),
-        GtSelection::Publish => {
-            // Publish 的定义保证了 front() 存在且帧号相等。
-            let matched = history
-                .front()
-                .expect("GtSelection::Publish 保证 front 存在");
-            if let Ok(mut publisher) = ctx.publisher.lock() {
-                publisher.publish_ground_truth(matched);
-                *last_published_seq = Some(published_seq);
-            }
-        }
-    }
-}
-
-/// `select_ground_truth` 的判定结果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GtSelection {
-    /// `history.front()` 与已落地图像同帧，发布它并推进水位。
-    Publish,
-    /// 历史里没有这一帧（发布端跳帧，或深度不足被挤掉）。只推进水位，
-    /// 否则下一帧会反复重扫同一个洞。
-    Skip,
-    /// 尚无图像落地，或这个帧号已经发过。什么都不做。
-    Wait,
-}
-
-/// 挑出"与已落地图像同帧"的那一批真值，并顺带修剪掉再也匹配不上的旧批次。
-///
-/// 抽成纯函数是为了能直接测三种边界：历史深度不足、发布端跳帧、以及同一帧号
-/// 被反复看到。这些在 Bevy system 里要靠 `Local` 状态复现，测起来很别扭。
-fn select_ground_truth(
-    history: &mut VecDeque<GroundTruthBatch>,
-    last_published_seq: Option<u64>,
-    published_seq: u64,
-) -> GtSelection {
-    // 还没有任何图像真正落地。哨兵不能用 0：frame_seq 从 0 开始（见
-    // NO_PUBLISHED_IMAGE 的说明），用 0 会把第 0 帧的真值永久吞掉。
-    if published_seq == NO_PUBLISHED_IMAGE {
-        return GtSelection::Wait;
-    }
-    // 图像帧率(约 8fps)远低于调用频率，同一帧号会反复看到；只发一次。
-    if last_published_seq == Some(published_seq) {
-        return GtSelection::Wait;
-    }
-    // 丢掉比已发布图像更旧的，它们再也不会被匹配上。
-    while history.front().is_some_and(|b| b.frame_seq < published_seq) {
-        history.pop_front();
-    }
-    if history
-        .front()
-        .is_some_and(|b| b.frame_seq == published_seq)
-    {
-        GtSelection::Publish
-    } else {
-        GtSelection::Skip
-    }
+    // 真值只流向评估器，不进算法输入（YOLO/Solver/Tracker/Planner），这条边界不变。
+    out.frame_seq = frame_seq;
+    out.batch = Some(Box::new(batch));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn batch(frame_seq: u64) -> GroundTruthBatch {
-        GroundTruthBatch {
-            frame_seq,
-            ..Default::default()
+    /// 第一块板缺 CENTER、第二块板有 CENTER：缺板只能跳过它自己。
+    ///
+    /// 修复前 `select_armor_center` 用 `?` 收尾，第一块缺 CENTER 的板会让整个函数
+    /// 返回 None，把后面所有板的板心一起丢掉，于是整车的 `armor_position_valid`
+    /// 恒为 0，消费端只能退回整车中心去算瞄准误差——凭空多出 2 度量级的固定几何差。
+    /// 断言是 `Some(最近板心)`：修复前无论 `armor_roots.iter()` 是什么顺序，只要
+    /// 缺板存在结果就是 None，所以这个断言不依赖 ECS 的迭代顺序。
+    #[test]
+    fn plate_without_center_skips_only_itself() {
+        use crate::robomaster::prelude::{ArmorId, ArmorSpec, SmallArmorLabel};
+        use bevy::ecs::system::RunSystemOnce;
+
+        fn armor_of(name: &str) -> Armor {
+            Armor {
+                name: name.to_string(),
+                team: Team::Blue,
+                spec: ArmorSpec::Small(SmallArmorLabel::Three),
+                label: crate::robomaster::prelude::ArmorLabel::Three,
+            }
         }
-    }
 
-    fn history(seqs: &[u64]) -> VecDeque<GroundTruthBatch> {
-        seqs.iter().copied().map(batch).collect()
-    }
+        let mut world = World::new();
+        let camera_pos = Vec3::new(0.0, 0.0, 0.0);
+        let vehicle = world.spawn(GlobalTransform::default()).id();
 
-    #[test]
-    fn frame_seq_zero_is_publishable_not_a_sentinel() {
-        // FRAME_SEQ.fetch_add 返回自增前的值，所以第一帧的 frame_seq 真的是 0。
-        // 旧代码用 `published_seq == 0` 当"还没发布"的哨兵，会把第 0 帧的真值
-        // 永久吞掉。哨兵必须是 NO_PUBLISHED_IMAGE。
-        let mut h = history(&[0, 1, 2]);
-        assert_eq!(select_ground_truth(&mut h, None, 0), GtSelection::Publish);
-        assert_eq!(h.front().unwrap().frame_seq, 0);
+        // 三块板都挂在同一辆车下，组件集合完全相同（同一个 archetype）。
+        let mut plate = |world: &mut World, id: usize, at: Vec3| {
+            let e = world
+                .spawn((
+                    armor_of("plate"),
+                    ArmorRoot {
+                        id: ArmorId::from_raw_for_test(id),
+                    },
+                    GlobalTransform::from_translation(at),
+                ))
+                .id();
+            world.entity_mut(vehicle).add_child(e);
+            e
+        };
 
-        let mut h = history(&[0, 1]);
-        assert_eq!(
-            select_ground_truth(&mut h, None, NO_PUBLISHED_IMAGE),
-            GtSelection::Wait,
-            "只有 NO_PUBLISHED_IMAGE 才表示尚无图像落地"
+        // 第一块：没有 CENTER 子节点（资产换了节点名 / 子树没加载完）。
+        plate(&mut world, 0, Vec3::new(0.0, 0.0, 1.0));
+
+        // 第二块：有 CENTER，但离相机远。
+        let far = plate(&mut world, 1, Vec3::new(0.0, 0.0, 3.0));
+        let far_center = Vec3::new(0.0, 0.0, 3.0);
+        let far_center_node = world
+            .spawn((
+                Name::new("PLATE_CENTER"),
+                GlobalTransform::from_translation(far_center),
+            ))
+            .id();
+        world.entity_mut(far).add_child(far_center_node);
+
+        // 第三块：有 CENTER 且最近，它才是应该被选中的那块。
+        let near = plate(&mut world, 2, Vec3::new(0.0, 0.0, 1.5));
+        let near_center = Vec3::new(0.0, 0.0, 1.5);
+        let near_center_node = world
+            .spawn((
+                Name::new("PLATE_CENTER"),
+                GlobalTransform::from_translation(near_center),
+            ))
+            .id();
+        world.entity_mut(near).add_child(near_center_node);
+
+        let got = world
+            .run_system_once(
+                move |qq: HierarchyQuery,
+                      armor_roots: Query<(Entity, &Armor), With<ArmorRoot>>,
+                      transforms: Query<&GlobalTransform>| {
+                    select_armor_center(vehicle, camera_pos, &qq, &armor_roots, &transforms)
+                },
+            )
+            .expect("system 运行失败");
+
+        let expected = to_ros_vec3(near_center);
+        let got = got.expect("缺 CENTER 的板不得让整车板心失效");
+        assert!(
+            got.distance(expected) < 1e-6,
+            "应选中最近的那块板心 {expected:?}，实际 {got:?}"
         );
-        assert_eq!(h.len(), 2, "Wait 不得修剪历史");
-    }
-
-    #[test]
-    fn same_published_seq_publishes_once() {
-        // 真值系统的调用频率远高于图像发布率，同一帧号会被看到很多次。
-        let mut h = history(&[7, 8]);
-        assert_eq!(select_ground_truth(&mut h, None, 7), GtSelection::Publish);
-        assert_eq!(
-            select_ground_truth(&mut h, Some(7), 7),
-            GtSelection::Wait,
-            "同一帧号第二次必须什么都不做"
-        );
-        assert_eq!(h.front().unwrap().frame_seq, 7, "Wait 不得弹出已发布的批次");
-    }
-
-    #[test]
-    fn publisher_frame_skip_advances_watermark() {
-        // 发布端丢了 8..=11 只发出 12：历史里 12 之前的都该被修剪掉，且因为
-        // 12 本身还没入历史（图像比真值早到的极端情况），结果是 Skip 而非 Publish。
-        let mut h = history(&[8, 9, 10, 11]);
-        assert_eq!(select_ground_truth(&mut h, Some(7), 12), GtSelection::Skip);
-        assert!(h.is_empty(), "比已发布图像更旧的批次全部修剪");
-
-        // Skip 之后水位推进，同一个洞不会被反复重扫。
-        assert_eq!(select_ground_truth(&mut h, Some(12), 12), GtSelection::Wait);
-    }
-
-    #[test]
-    fn insufficient_history_depth_skips_instead_of_mismatching() {
-        // 历史深度不足时目标帧已被挤掉，剩下的都比它新。绝不能拿一个更新的
-        // 批次冒充同帧真值 —— 消费端的 fetch() 只比帧号，配错就是静默错数据。
-        let mut h = history(&[20, 21, 22]);
-        assert_eq!(
-            select_ground_truth(&mut h, Some(18), 19),
-            GtSelection::Skip,
-            "目标帧被挤掉时必须 Skip"
-        );
-        assert_eq!(h.len(), 3, "更新的批次不得被误删，它们还要匹配后续图像");
-        assert_eq!(h.front().unwrap().frame_seq, 20);
-    }
-
-    #[test]
-    fn history_depth_bound_is_the_publish_lag_limit() {
-        // 深度 GT_HISTORY_DEPTH 能容忍的最大图像滞后就是 GT_HISTORY_DEPTH-1 帧：
-        // 队尾是当前帧，队首是最旧的仍在册帧。刚好落在边界上要能命中。
-        let seqs: Vec<u64> = (0..GT_HISTORY_DEPTH as u64).collect();
-        let mut h = history(&seqs);
-        assert_eq!(select_ground_truth(&mut h, None, 0), GtSelection::Publish);
-
-        // 再滞后一帧就落到窗口外了。
-        let seqs: Vec<u64> = (1..=GT_HISTORY_DEPTH as u64).collect();
-        let mut h = history(&seqs);
-        assert_eq!(select_ground_truth(&mut h, None, 0), GtSelection::Skip);
-    }
-
-    #[test]
-    fn empty_history_skips() {
-        let mut h: VecDeque<GroundTruthBatch> = VecDeque::new();
-        assert_eq!(select_ground_truth(&mut h, None, 5), GtSelection::Skip);
     }
 
     #[test]

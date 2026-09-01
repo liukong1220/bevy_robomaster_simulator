@@ -28,7 +28,9 @@ use bevy_inspector_egui::bevy_egui::EguiPlugin;
 use bevy_inspector_egui::quick::WorldInspectorPlugin;
 use std::sync::atomic::AtomicBool;
 
-use crate::components::{CameraMode, FollowingType, ProjectileCooldown, SubscribeAutoAim};
+use crate::components::{
+    CameraMode, FollowingType, MouseCapture, ProjectileCooldown, SubscribeAutoAim,
+};
 use crate::config::{ConfigPlugin, SimulationConfig};
 use crate::handler::{on_activate, on_hit};
 use crate::metalfx::MetalFxTemporalPlugin;
@@ -41,9 +43,9 @@ use crate::systems::{
     controller_shoot_pressed, dart_launch, following_controls, freecam_controls, gimbal_controls,
     log_projectile_stats, projectile_aerodynamics, projectile_launch, remote_gimbal_controls,
     remote_vehicle_controls, sample_gamepad_controller, sample_keyboard_controller,
-    screenshot_on_f2, screenshot_on_timer, screenshot_saving, setup_projectile,
-    switch_slapper_control, uav_launch,
-    update_auto_aim_subscription, update_chassis_observation, update_help_text, vehicle_controls,
+    sample_mouse_controller, screenshot_on_f2, screenshot_on_timer, screenshot_saving,
+    setup_projectile, switch_slapper_control, uav_launch, update_auto_aim_subscription,
+    update_chassis_observation, update_cursor_capture, update_help_text, vehicle_controls,
 };
 
 #[cfg(feature = "ros2")]
@@ -160,6 +162,7 @@ fn main() {
         .add_plugins(MetalFxTemporalPlugin)
         .add_plugins(ConfigPlugin)
         .init_resource::<CameraMode>()
+        .init_resource::<MouseCapture>()
         .init_resource::<ProjectileStatistics>()
         .init_resource::<ChassisObservationFrame>()
         .init_resource::<PreviousKinematicState>()
@@ -196,7 +199,11 @@ fn main() {
                 // Input phase
                 (
                     clear_controller_input,
+                    // 捕获状态要先更新：sample_mouse_controller 只在捕获中把鼠标
+                    // 位移当瞄准输入，否则要把事件读掉丢弃（见该函数注释）。
+                    update_cursor_capture,
                     sample_keyboard_controller,
+                    sample_mouse_controller,
                     sample_gamepad_controller,
                     update_auto_aim_subscription,
                     following_controls,

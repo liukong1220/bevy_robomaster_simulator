@@ -2,24 +2,51 @@ use bevy::prelude::*;
 use bevy::render::view::screenshot::{Capturing, Screenshot, save_to_disk};
 use bevy::window::{CursorIcon, SystemCursorIcon, Window};
 
-use crate::components::{SlapperInfantry, SubscribeAutoAim};
+use crate::components::{MouseCapture, SlapperInfantry, SubscribeAutoAim};
 use crate::robomaster::prelude::{Armor, ArmorStickerSelection};
 use crate::statistic::ProjectileStatistics;
 use crate::systems::ControllerState;
+use crate::talos::AutoAimLink;
+
+/// 外部 `gimbal_cmd` 链路的状态文字。
+///
+/// 自瞄打开时云台只听共享内存里的命令（`gimbal_controls` 会直接 return），
+/// 所以"没在跟随"有三种完全不同的原因，必须能在界面上分开：视觉侧没启动
+/// （未收到）、启动过又断了（中断）、以及正常在收（在线）。
+fn link_status(auto_aim: bool, link: Option<&AutoAimLink>, now_secs: f32) -> &'static str {
+    if !auto_aim {
+        return "未订阅";
+    }
+    let Some(link) = link else {
+        // TalosPlugin 建共享内存失败时整个 plugin 提前返回，资源都不存在。
+        return "无通道";
+    };
+    match link.last_cmd_secs {
+        None => "未收到",
+        // 0.5s 与 sp_vision25 侧的 heartbeat_timeout_ms 同量级：视觉侧正常跑
+        // 时安全停止都是 20ms 一发，半秒没有任何命令就是真的断了。
+        Some(last) if now_secs - last <= 0.5 => "在线",
+        Some(_) => "中断",
+    }
+}
 
 fn create_help_text(
     auto_aim: bool,
     stats: &ProjectileStatistics,
     controller: &ControllerState,
+    mouse_captured: bool,
+    link: &'static str,
 ) -> Text {
     format!(
-        "自瞄={} 发弹总数={} 命中={} 命中率={:.2}%\n控制器={} 模式={} 小陀螺={} 远程小陀螺={}\n{}",
+        "自瞄={} 外部命令={} 发弹总数={} 命中={} 命中率={:.1}%\n控制器={} 模式={} 鼠标={} 小陀螺={} 远程小陀螺={}\n{}",
         if auto_aim { "开" } else { "关" },
+        link,
         stats.launch_count,
         stats.accurate_count,
         stats.accurate_pct(),
         controller.help_source(),
         controller.help_mode(auto_aim),
+        if mouse_captured { "捕获" } else { "释放" },
         if controller.controlled_chassis_spin() {
             "开"
         } else {
@@ -40,13 +67,15 @@ pub fn spawn_text(commands: &mut Commands, asset_server: &AssetServer) {
         Text::new(""),
         // bevy 内置的默认字体只有拉丁字形，中文会整段渲染成缺字框。
         // assets/fonts/hud_cjk.otf 是从 Noto Sans CJK SC 子集化出来的
-        // （402 个字形 = src/ 下所有字符串字面量里的非 ASCII 字符 + 可打印
-        // ASCII，174KB），避免把 19MB 的 CJK 全字库入库。
+        // （310 个码点 = src/ 下所有字符串字面量里的非 ASCII 字符 + 可打印
+        // ASCII，141KB），避免把 19MB 的 CJK 全字库入库。
         //
         // 子集必须按源码里实际出现的字符生成，不能手写字表：第一版是手列的，
         // 漏了"数""方向键""空格"等等，HUD 上就是一个个缺字框（□），而 Rust
-        // 编译期完全不会提示。改动任何界面文案后要重新生成，判据是
-        // fontTools 校验"字面量里的每个非 ASCII 字符都在 cmap 里"。
+        // 编译期完全不会提示。改动任何界面文案后跑
+        // `python3 scripts/build_hud_font.py` 重新生成，`--verify` 是只校验模式。
+        // 来源、版本、许可与 SC/JP 字形分支的核对见 assets/fonts/README.md 与
+        // 同目录 OFL.txt。
         TextFont {
             font: FontSource::Handle(asset_server.load("fonts/hud_cjk.otf")),
             ..default()
@@ -65,11 +94,17 @@ pub fn update_help_text(
     auto_aim: Res<SubscribeAutoAim>,
     stats: Res<ProjectileStatistics>,
     controller: Res<ControllerState>,
+    capture: Res<MouseCapture>,
+    link: Option<Res<AutoAimLink>>,
+    time: Res<Time>,
 ) {
+    let auto_aim = auto_aim.load(std::sync::atomic::Ordering::Acquire);
     let next = create_help_text(
-        auto_aim.load(std::sync::atomic::Ordering::Acquire),
+        auto_aim,
         &stats,
         &controller,
+        capture.captured,
+        link_status(auto_aim, link.as_deref(), time.elapsed_secs()),
     );
     for mut text in text.iter_mut() {
         // 只在内容真的变了才写。无条件 `*text = ...` 每帧都触发变更检测，

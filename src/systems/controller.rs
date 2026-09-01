@@ -1,9 +1,11 @@
 use bevy::input::gamepad::{GamepadRumbleIntensity, GamepadRumbleRequest};
+use bevy::input::mouse::MouseMotion;
 use bevy::prelude::*;
 use core::time::Duration;
 use std::sync::atomic::Ordering;
 
-use crate::components::SubscribeAutoAim;
+use crate::components::{CameraMode, FollowingType, MouseCapture, SubscribeAutoAim};
+use crate::config::SimulationConfig;
 
 const GAMEPAD_STICK_DEADZONE: f32 = 0.12;
 const GAMEPAD_TRIGGER_THRESHOLD: f32 = 0.35;
@@ -20,8 +22,8 @@ impl ControllerHelp {
     const fn keyboard() -> Self {
         Self {
             source: "keyboard",
-            manual: "F3 视角 | WASD 移动 | 方向键 瞄准 | 空格 射击 | G 飞镖 | Q 小陀螺 | U 远程小陀螺 | F5 自瞄 | Tab 拍打",
-            auto_aim: "F5 关闭自瞄 | WASD 移动 | Q 小陀螺 | U 远程小陀螺 | 由外部 fire_advice 控制射击 | Tab 拍打",
+            manual: "F3 视角 | WASD 移动 | 左键 捕获鼠标 / Esc 释放 | 鼠标或方向键 瞄准 | 空格 射击 | G 飞镖 | Q 小陀螺 | U 远程小陀螺 | F5 自瞄 | Tab 拍打",
+            auto_aim: "F5 关闭自瞄（自瞄期间鼠标与方向键不控云台）| WASD 移动 | Q 小陀螺 | U 远程小陀螺 | 由外部 fire_advice 控制射击 | Tab 拍打",
         }
     }
 
@@ -71,6 +73,12 @@ impl ChassisSpinMode {
 pub struct ControllerInput {
     pub movement: Vec2,
     pub gimbal: Vec2,
+    /// 一帧内的云台角度增量（弧度），与 `gimbal` 是**两种不同的量**：
+    /// `gimbal` 是被 clamp 到 [-1,1] 的速率轴（方向键、摇杆），要乘
+    /// `gimbal_rotation_speed * dt`；这个字段是鼠标那种已经带位移大小的增量，
+    /// 直接累加。把鼠标塞进 `gimbal` 里会被 clamp 成"按住方向键"，
+    /// 于是轻推和猛甩一个速度，手感完全糊掉。
+    pub gimbal_delta: Vec2,
     pub chassis_yaw: f32,
     pub chassis_roll: f32,
     pub chassis_pitch: f32,
@@ -88,6 +96,7 @@ impl Default for ControllerInput {
         Self {
             movement: Vec2::ZERO,
             gimbal: Vec2::ZERO,
+            gimbal_delta: Vec2::ZERO,
             chassis_yaw: 0.0,
             chassis_roll: 0.0,
             chassis_pitch: 0.0,
@@ -121,6 +130,11 @@ impl ControllerInput {
 
     fn add_gimbal(&mut self, gimbal: Vec2) {
         self.gimbal = clamp_axes_vec2(self.gimbal + gimbal);
+    }
+
+    /// 累加角度增量。不 clamp：这是"鼠标移动了多少"，本身就没有归一化上界。
+    fn add_gimbal_delta(&mut self, delta: Vec2) {
+        self.gimbal_delta += delta;
     }
 
     fn add_chassis(&mut self, yaw: f32, roll: f32, pitch: f32) {
@@ -278,6 +292,52 @@ pub fn sample_keyboard_controller(
     if keyboard.just_pressed(KeyCode::F5) {
         controller.toggle_keyboard_auto_aim();
     }
+}
+
+/// 鼠标位移 -> 云台瞄准增量。
+///
+/// 第一人称（`FollowingType::Robot`）的相机是刚性挂在云台挂载点上的
+/// （见 `update_camera_follow`），所以"用鼠标转视角"在这个仿真器里就等于
+/// "用鼠标转云台"，和真车操作手的手感一致，也不需要给相机再加一套独立朝向。
+///
+/// 之前这条通路完全不存在：全树只有 `freecam_controls` 读 `MouseMotion`，
+/// 而它开头就 `if mode.0 != FollowingType::Free { return; }`。于是第一人称下
+/// 鼠标怎么动都没反应，只能用方向键瞄准。
+///
+/// Free 视角刻意不处理：那里鼠标归 `freecam_controls`，两边都吃同一批
+/// `MouseMotion` 会让自由相机和云台一起转。
+pub fn sample_mouse_controller(
+    mut mouse_motion: MessageReader<MouseMotion>,
+    capture: Res<MouseCapture>,
+    mode: Res<CameraMode>,
+    config: Res<SimulationConfig>,
+    mut controller: ResMut<ControllerState>,
+) {
+    if mode.0 == FollowingType::Free || !capture.captured {
+        // 事件必须照样读掉。留在队列里下次一起读，就会在重新捕获的瞬间
+        // 把释放期间攒下的全部位移一次性甩到云台上。
+        mouse_motion.clear();
+        return;
+    }
+
+    let mut delta = Vec2::ZERO;
+    for motion in mouse_motion.read() {
+        delta += motion.delta;
+    }
+    if delta == Vec2::ZERO {
+        return;
+    }
+
+    controller.use_help(ControllerHelp::keyboard());
+
+    // 符号与 `freecam_controls` 保持一致：鼠标右移 = 视角右转 = yaw 减小
+    // （bevy 绕 +Y 为左转），鼠标上移（`delta.y` 为负）= 抬头 = pitch 增大。
+    // `gimbal_controls` 里 `local_yaw += gimbal.x * speed`、方向键左是 +1，
+    // 所以这里取负号后两种输入方向一致。
+    let scale = config.camera.mouse_sensitivity * controller.controlled.gimbal_scale();
+    controller
+        .controlled
+        .add_gimbal_delta(Vec2::new(-delta.x, -delta.y) * scale);
 }
 
 pub fn sample_gamepad_controller(
@@ -568,6 +628,94 @@ mod tests {
         controller.reset_frame();
 
         assert_eq!(controller.help_source(), "xbox");
+    }
+
+    /// 起一个只装了鼠标采样所需资源的最小 App。
+    ///
+    /// 直接调函数测不了这条链路的关键部分：`MessageReader` 的游标、"未捕获时
+    /// 必须把事件读掉"这两件事都只在真的跑 schedule 时才成立。
+    fn mouse_app(mode: FollowingType, captured: bool) -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.add_message::<MouseMotion>();
+        app.insert_resource(CameraMode(mode));
+        app.insert_resource(MouseCapture { captured });
+        app.insert_resource(SimulationConfig::default());
+        app.init_resource::<ControllerState>();
+        app.add_systems(Update, sample_mouse_controller);
+        app
+    }
+
+    fn push_motion(app: &mut App, delta: Vec2) {
+        app.world_mut().write_message(MouseMotion { delta });
+    }
+
+    fn gimbal_delta(app: &App) -> Vec2 {
+        app.world().resource::<ControllerState>().controlled.gimbal_delta
+    }
+
+    #[test]
+    fn mouse_motion_aims_gimbal_in_first_person() {
+        let mut app = mouse_app(FollowingType::Robot, true);
+        let sensitivity = app.world().resource::<SimulationConfig>().camera.mouse_sensitivity;
+
+        push_motion(&mut app, Vec2::new(10.0, 4.0));
+        app.update();
+
+        // 鼠标右移 -> yaw 减小（bevy 绕 +Y 为左转）；鼠标下移(delta.y>0) -> 低头。
+        // 这两个符号必须与 freecam_controls 一致，否则切视角时手感反向。
+        let delta = gimbal_delta(&app);
+        assert!((delta.x - (-10.0 * sensitivity)).abs() < 1e-6, "yaw 方向或标度不对: {delta:?}");
+        assert!((delta.y - (-4.0 * sensitivity)).abs() < 1e-6, "pitch 方向或标度不对: {delta:?}");
+    }
+
+    #[test]
+    fn mouse_motion_accumulates_within_one_frame() {
+        let mut app = mouse_app(FollowingType::Robot, true);
+        let sensitivity = app.world().resource::<SimulationConfig>().camera.mouse_sensitivity;
+
+        push_motion(&mut app, Vec2::new(3.0, 0.0));
+        push_motion(&mut app, Vec2::new(4.0, 0.0));
+        app.update();
+
+        // 一帧内可能来多个 MouseMotion，只取最后一个就会丢掉大部分位移。
+        assert!((gimbal_delta(&app).x - (-7.0 * sensitivity)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn released_cursor_drops_motion_instead_of_buffering_it() {
+        let mut app = mouse_app(FollowingType::Robot, false);
+
+        push_motion(&mut app, Vec2::new(500.0, 0.0));
+        app.update();
+        assert_eq!(gimbal_delta(&app), Vec2::ZERO, "未捕获时不应产生瞄准输入");
+
+        // 重新捕获后，释放期间攒下的位移不能被一次性甩到云台上。
+        app.world_mut().resource_mut::<MouseCapture>().captured = true;
+        app.update();
+        assert_eq!(gimbal_delta(&app), Vec2::ZERO, "释放期间的位移被缓存后补发了");
+    }
+
+    #[test]
+    fn free_camera_keeps_mouse_for_itself() {
+        let mut app = mouse_app(FollowingType::Free, true);
+
+        push_motion(&mut app, Vec2::new(10.0, 10.0));
+        app.update();
+
+        // Free 视角下鼠标归 freecam_controls；两边都吃会让相机和云台一起转。
+        assert_eq!(gimbal_delta(&app), Vec2::ZERO);
+    }
+
+    #[test]
+    fn reset_frame_clears_mouse_aim_delta() {
+        let mut controller = ControllerState::default();
+        controller.controlled.add_gimbal_delta(Vec2::new(0.1, 0.1));
+
+        controller.reset_frame();
+
+        // 不清零的话鼠标停下后云台会按最后一帧的增量一直转。
+        assert_eq!(controller.controlled.gimbal_delta, Vec2::ZERO);
     }
 
     #[test]

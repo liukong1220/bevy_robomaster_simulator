@@ -121,6 +121,13 @@ impl ArmorId {
     pub const fn as_usize(self) -> usize {
         self.0
     }
+
+    /// 仅供单测构造 `ArmorRoot`。生产路径必须走 `ID.fetch_add`，否则会出现重复 id
+    /// 进而让 `light_visibility_id` 撞号，所以这个入口不对非测试构建开放。
+    #[cfg(test)]
+    pub(crate) const fn from_raw_for_test(id: usize) -> Self {
+        Self(id)
+    }
 }
 
 #[derive(Component, Clone)]

@@ -164,8 +164,12 @@ pub fn gimbal_controls(
 
     let controller = controller.controlled;
     let rotation_speed = config.vehicle.gimbal_rotation_speed * controller.gimbal_scale() * dt;
-    gimbal_data.local_yaw += controller.gimbal.x * rotation_speed;
-    gimbal_data.pitch += controller.gimbal.y * rotation_speed;
+    // 两路输入相加：`gimbal` 是速率轴（方向键/摇杆，要乘 speed*dt），
+    // `gimbal_delta` 已经是本帧的角度增量（鼠标，`sample_mouse_controller`
+    // 里按 mouse_sensitivity 换算过），不能再乘 dt——否则同样的手部位移在
+    // 不同帧率下转出不同角度。
+    gimbal_data.local_yaw += controller.gimbal.x * rotation_speed + controller.gimbal_delta.x;
+    gimbal_data.pitch += controller.gimbal.y * rotation_speed + controller.gimbal_delta.y;
 
     gimbal_data.pitch = gimbal_data.pitch.clamp(
         -config.vehicle.gimbal_pitch_limit,

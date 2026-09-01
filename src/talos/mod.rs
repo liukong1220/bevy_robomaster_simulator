@@ -7,4 +7,4 @@ mod capture;
 mod ground_truth;
 mod plugin;
 
-pub use plugin::TalosPlugin;
+pub use plugin::{AutoAimLink, TalosPlugin};

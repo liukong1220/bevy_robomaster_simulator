@@ -5,7 +5,33 @@ pub const IMAGE_HEIGHT: u32 = 1080;
 
 pub const CACHE_LINE_SIZE: usize = 64;
 pub const SHM_MAGIC: u32 = 0x54414C05;
-pub const SHM_VERSION: u32 = 2;
+/// 协议版本。
+///
+/// v2 -> v3：`poses[Muzzle]` 由"相对云台的局部平移 + 单位四元数"改为**完整世界
+/// 位姿**（见 [`PoseIndex::Muzzle`]），并在 [`ShmHeader::capabilities`] 里显式声明
+/// 各可选区域是否有效。
+///
+/// 语义变更必须升版本号：字节布局没变，旧消费端照旧能 mmap、能读出数字，只是把
+/// 世界坐标当成局部偏移继续算——那是静默的错误答案，比连不上更难发现。
+pub const SHM_VERSION: u32 = 3;
+
+/// `ShmHeader::capabilities` 的位定义。
+///
+/// 版本号只能表达"协议第几代"，表达不了"这一代的发布端实际填了哪些可选区域"。
+/// 真值区就是典型：布局里一直有 `ground_truth`，但只有仿真器本体会填，测试用的
+/// 精简发布端不会。消费端不看能力位就只能靠"读出来是不是全零"猜，而全零同样是
+/// 合法数据，于是**新消费端对着不发真值的发布端会静默失去真值**。
+pub const CAP_GROUND_TRUTH: u32 = 1 << 0;
+/// `poses[Muzzle]` 是世界位姿（v3 语义）。未置位表示 v2 的局部平移语义。
+pub const CAP_MUZZLE_WORLD_POSE: u32 = 1 << 1;
+/// `chassis_observation` 区有效。
+pub const CAP_CHASSIS_OBSERVATION: u32 = 1 << 2;
+/// `runtime_state` 区有效。
+pub const CAP_RUNTIME_STATE: u32 = 1 << 3;
+
+/// 仿真器本体发布的能力集合。
+pub const SIMULATOR_CAPABILITIES: u32 =
+    CAP_GROUND_TRUTH | CAP_MUZZLE_WORLD_POSE | CAP_CHASSIS_OBSERVATION | CAP_RUNTIME_STATE;
 
 pub const IMAGE_CHANNELS: u32 = 3;
 pub const IMAGE_SIZE: usize = (IMAGE_WIDTH * IMAGE_HEIGHT * IMAGE_CHANNELS) as usize;
@@ -156,9 +182,13 @@ pub struct ShmHeader {
     pub heartbeat_ns: u64,
     pub image_width: u32,
     pub image_height: u32,
-    pub _pad: [u8; 32],
+    /// 可选区域能力位，见 [`CAP_GROUND_TRUTH`] 等。占用原 `_pad` 的前 4 字节，
+    /// 结构体大小与其余偏移不变。
+    pub capabilities: u32,
+    pub _pad: [u8; 28],
 }
 const _: () = assert!(size_of::<ShmHeader>() == 64);
+const _: () = assert!(core::mem::offset_of!(ShmHeader, capabilities) == 32);
 
 pub const GROUND_TRUTH_MAX_TARGETS: usize = 16;
 pub const GROUND_TRUTH_MAX_RUNES: usize = 4;
@@ -257,6 +287,18 @@ pub struct GroundTruthBatch {
 const _: () = assert!(size_of::<GroundTruthBatch>() == 1664);
 const _: () = assert!(core::mem::offset_of!(GroundTruthBatch, seqlock) == 1600);
 
+/// seqlock 标记之前的 payload 字节数，即整块里"真正的数据"。
+///
+/// 两端拷贝 payload 时都只拷这段前缀，标记本身只用原子读写访问。整块 memcpy
+/// 会顺带覆盖/读取 4 字节的标记：写端等于用非原子写踩自己的同步变量，读端等于
+/// 用非原子读取一个正在被并发修改的原子变量——两者都是数据竞争（UB），而且写端
+/// 那一路还会让"标记先置奇再被 body 覆盖成别的值"，读端的前后比较可能意外通过。
+///
+/// 标记之后只有 `_pad`，所以这段前缀覆盖了全部有效字段。
+pub const GROUND_TRUTH_PAYLOAD_BYTES: usize = 1600;
+const _: () =
+    assert!(GROUND_TRUTH_PAYLOAD_BYTES == core::mem::offset_of!(GroundTruthBatch, seqlock));
+
 impl Default for GroundTruthBatch {
     fn default() -> Self {
         Self {
@@ -308,6 +350,27 @@ const _: () = assert!(std::mem::offset_of!(ShmMetaRegion, chassis_observation) =
 const _: () = assert!(std::mem::offset_of!(ShmMetaRegion, ground_truth) == 1984);
 const _: () = assert!(std::mem::offset_of!(ShmMetaRegion, runtime_state) == 3648);
 
+/// 位姿通道。所有平移与旋转都已经转到 ROS 约定（x 前、y 左、z 上），
+/// 四元数按 `[w, x, y, z]` 发布。
+///
+/// **各通道的参考系不同，混用会静默出错**，逐条写明：
+///
+/// | 通道 | position | quaternion |
+/// |------|----------|------------|
+/// | `Gimbal` | 恒为 `[0,0,0]`（占位，不是坐标） | 云台/枪管的**世界**姿态 `world <- gimbal` |
+/// | `Odom` | 云台回转中心的**世界**位置 | 单位四元数（占位） |
+/// | `Muzzle` | 枪口的**世界**位置 | 枪口的**世界**姿态（同 `Gimbal`） |
+/// | `Camera` | 相机相对云台的**局部**平移 | 单位四元数（占位） |
+///
+/// `Camera` 刻意保持局部：消费端拿它与自己配置里的 `t_camera2gimbal` 外参做
+/// 自检，那是一个局部量。
+///
+/// `Muzzle` 在 v2 里也是局部平移，v3 改为世界位姿（能力位
+/// [`CAP_MUZZLE_WORLD_POSE`]）。原因是局部量太容易被误用：消费端见到 `Odom` 是
+/// 世界位置、`Muzzle` 是"偏移"，最自然的写法就是 `odom + muzzle`，而那是把一个
+/// **未经云台旋转**的局部平移直接加到世界坐标上。yaw=90° 时 0.11 m 的局部 +X
+/// 实际指向世界 +Y，误差达到偏移量的全长，且随姿态变化，看起来像闭环残差。
+/// 直接发布世界量让消费端无从误用。
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoseIndex {
@@ -365,7 +428,11 @@ impl Default for ShmHeader {
             heartbeat_ns: 0,
             image_width: IMAGE_WIDTH,
             image_height: IMAGE_HEIGHT,
-            _pad: [0; 32],
+            // Default 不声明任何能力：谁真的填了对应区域，谁就自己置位。
+            // 让 Default 直接宣称 SIMULATOR_CAPABILITIES 会把"布局里有这个字段"
+            // 冒充成"这一路发布端真的在写这个字段"，正是能力位要防的那件事。
+            capabilities: 0,
+            _pad: [0; 28],
         }
     }
 }

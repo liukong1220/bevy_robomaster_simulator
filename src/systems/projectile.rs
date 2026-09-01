@@ -53,9 +53,12 @@ pub fn projectile_launch(
         (&GlobalTransform, &InfantryGimbal),
         (With<Controlled>, Without<InfantryChassis>),
     >,
-    launch_offset: Single<&Transform, (With<Controlled>, With<InfantryLaunchOffset>)>,
+    launch_offset: Single<
+        (&Transform, &GlobalTransform),
+        (With<Controlled>, With<InfantryLaunchOffset>),
+    >,
 ) {
-    let launch_offset = launch_offset.into_inner();
+    let (launch_offset, launch_global) = launch_offset.into_inner();
     cooldown.tick(time.delta());
     if !cooldown.is_finished() {
         return;
@@ -94,9 +97,18 @@ pub fn projectile_launch(
         MeshMaterial3d(setting.1.clone()),
         LinearVelocity(vel),
         AngularVelocity(infantry.2.0),
-        Transform::IDENTITY.with_translation(
-            infantry.0.translation + (gimbal.0.rotation() * launch_offset.translation),
-        ),
+        // 出膛点 = 枪口的世界位置，直接取 SHOT_DIRECTION 的 GlobalTransform。
+        //
+        // 原来是 `infantry.0.translation + gimbal.0.rotation() * launch_offset.translation`，
+        // 把**底盘根节点**的平移当作基准，再加上一段绕云台旋转过的局部偏移。可
+        // SHOT_DIRECTION 是 GIMBAL 的后代（见 setup.rs），它的世界位置基准是 GIMBAL
+        // 节点的世界平移，不是根节点的——两者相差 (gimbal_global - root) 这一段，
+        // 也就是底盘原点到云台回转中心的位移，恒定存在且随底盘姿态旋转。
+        //
+        // 这与 talos 的 PoseIndex::Muzzle 是同一类错误（把不同参考系的量相加）。修
+        // 正后出膛点与共享内存里发布的枪口世界位置严格是同一个量，闭环评估的瞄准
+        // 误差才有一个自洽的参考原点。
+        Transform::IDENTITY.with_translation(launch_global.translation()),
         ProjectileLifetime(Timer::from_seconds(
             config.projectile.lifetime,
             TimerMode::Once,

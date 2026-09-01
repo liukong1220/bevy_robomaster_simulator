@@ -20,13 +20,29 @@ use talos_ipc::*;
 
 static FRAME_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// `published_image_seq` 的"还没有发布过任何图像"哨兵。
+/// 本帧采集到的真值批次，等待与图像在**同一次发布事务**里提交。
 ///
-/// 不能用 0：`FRAME_SEQ.fetch_add(1, ..)` 返回自增前的值，所以第一张真正发出去
-/// 的图像 frame_seq 就是 0。原来用 `== 0` 当哨兵会让第 0 帧的真值永远发不出去，
-/// 而这恰好是启动后目标刚进视野、最需要看清估计误差的那一帧。
-/// `u64::MAX` 不可能被 frame_seq 取到（每帧 +1，溢出需要 5.8e11 年）。
-pub const NO_PUBLISHED_IMAGE: u64 = u64::MAX;
+/// 协议约定（v3）：真值批次与图像、同帧姿态三者的 `frame_seq` 严格相等，没有任何
+/// 允许的偏移。实现方式是 [`ShmPublisher::publish_image_with`] 的 `before_commit`
+/// 回调——图像 meta 是消费端唯一的提交标记，回调里发布的东西一定先于它可见，所以
+/// "消费端看见图像 seq=k" 就蕴含 "真值槽位里已经是 seq=k"。
+///
+/// 之前的做法是攒一段真值历史（`GT_HISTORY_DEPTH`），再按"图像发到哪一帧了"回放
+/// 同帧的那一批。它做不到同帧：回放系统在主世界的 `Last` 里跑，而图像是在渲染世界
+/// 的回读回调里落地的，两者天然差一个节拍，实测 `seq_skew` 恒为 -1，
+/// `seq_mismatches` 占 frames_ok 的 10~17%。加大历史深度对此毫无作用（深度 256
+/// 实测 13.6%），因为成因不是"旧批次被挤掉"而是"提交时序差一拍"。
+///
+/// 真值只能流向评估器，绝不进入 YOLO/Solver/Tracker/Planner，这条边界不变。
+#[derive(Resource, Default)]
+pub struct TalosGroundTruthFrame {
+    /// 采集这一批真值时的 `TalosFrameStamp::frame_seq`。
+    pub frame_seq: u64,
+    /// `None` = 本帧没有采集到真值（没有 TalosCaptureContext，或系统未运行）。
+    /// 装箱是因为 `GroundTruthBatch` 有 1664 字节，不适合按值塞进每帧都要 clone
+    /// 的 `ExtractedPoseData`。
+    pub batch: Option<Box<GroundTruthBatch>>,
+}
 
 #[derive(Resource, Debug, Clone, Copy, Default)]
 pub struct TalosFrameStamp {
@@ -45,15 +61,23 @@ pub struct ExtractedPoseData {
     pub frame_seq: u64,
     pub timestamp_ns: u64,
     pose: Option<CapturedPoseData>,
+    /// 与 `pose` 同一个快照里的真值批次，随图像在同一次发布事务里提交。
+    /// `None` = 本帧没采集到真值（评估侧会看到样本变少，但绝不会拿到错帧的真值）。
+    ground_truth: Option<Box<GroundTruthBatch>>,
     pub valid: bool,
 }
 
 /// Pose data captured at frame snapshot time
 #[derive(Clone)]
 struct CapturedPoseData {
+    /// 云台回转中心的世界位置（ROS 约定）。
     gimbal_ros: [f32; 3],
+    /// 枪管的世界姿态 `world <- gimbal`（ROS 约定，`[w,x,y,z]`）。
     gimbal_quat: [f32; 4],
-    muzzle_rel: [f32; 3],
+    /// 枪口的**世界**位置（ROS 约定）。协议 v3 起发布世界量，见 `PoseIndex::Muzzle`。
+    muzzle_world: [f32; 3],
+    /// 相机相对云台的**局部**平移（ROS 约定）。消费端用它与自己的
+    /// `t_camera2gimbal` 外参自检，所以刻意保持局部。
     camera_rel: [f32; 3],
     chassis_observation: ChassisObservation,
 }
@@ -69,6 +93,7 @@ struct TalosSnapshotSync {
     frame_seq: u64,
     timestamp_ns: u64,
     pose: CapturedPoseData,
+    ground_truth: Option<Box<GroundTruthBatch>>,
 }
 
 impl SnapshotSync for TalosSnapshotSync {
@@ -78,27 +103,23 @@ impl SnapshotSync for TalosSnapshotSync {
         _config: &CaptureConfig,
     ) -> Box<dyn SnapshotAsync> {
         let ctx = world.resource::<TalosCaptureContextShared>().0.clone();
-        let published_image_seq = world
-            .resource::<TalosCaptureContext>()
-            .published_image_seq
-            .clone();
 
         Box::new(TalosSnapshot {
             ctx,
-            published_image_seq,
             frame_seq: self.frame_seq,
             timestamp_ns: self.timestamp_ns,
             pose: self.pose,
+            ground_truth: self.ground_truth,
         })
     }
 }
 
 struct TalosSnapshot {
     ctx: Arc<Mutex<ShmPublisher>>,
-    published_image_seq: Arc<AtomicU64>,
     frame_seq: u64,
     timestamp_ns: u64,
     pose: CapturedPoseData,
+    ground_truth: Option<Box<GroundTruthBatch>>,
 }
 
 impl SnapshotAsync for TalosSnapshot {
@@ -126,19 +147,30 @@ impl SnapshotAsync for TalosSnapshot {
         }
 
         if let Ok(mut publisher) = self.ctx.lock() {
-            let published = publisher.try_publish_synchronized_image(
+            // 图像、同帧姿态、同帧真值必须在同一次发布事务里提交。
+            //
+            // `before_commit` 在像素拷贝之后、图像 meta（消费端唯一的提交标记）之前
+            // 运行，所以这里发布的一切都严格先于图像可见。加上背压握手
+            // （`synchronized_frame_consumed`：图像与 poses[0..=Camera] 的 FLAG_NEW
+            // 全部清掉才允许发下一帧），消费端"看见图像 seq=k"就蕴含"真值槽位里
+            // 已经是 seq=k，且在本帧被消费完之前不会前进"。
+            //
+            // 事务失败（背压未放行 / 帧号未前进）时整个回调不执行，真值也就不会被
+            // 提交去对齐一帧根本没发出去的图像。
+            // 返回值故意丢弃：事务被背压挡住时"本帧不发"就是正确行为，没有额外
+            // 动作可做。之前需要它是为了给真值回放记账（只有发成功才推进水位），
+            // 现在真值就在这个事务里，成功与否与它天然一致。
+            let _published = publisher.try_publish_synchronized_image(
                 frame.data,
                 self.frame_seq,
                 self.timestamp_ns,
                 |publisher| {
                     publish_pose_data(publisher, self.frame_seq, self.timestamp_ns, &self.pose);
+                    if let Some(batch) = self.ground_truth.as_deref() {
+                        publisher.publish_ground_truth(batch);
+                    }
                 },
             );
-            // 只有真的写成功才记账，否则真值会去对齐一帧根本没发出去的图像。
-            if published {
-                self.published_image_seq
-                    .store(self.frame_seq, Ordering::Release);
-            }
         }
     }
 }
@@ -163,6 +195,7 @@ impl GpuCaptureHandler for TalosSnapshotCreator {
             frame_seq: extracted.frame_seq,
             timestamp_ns: extracted.timestamp_ns,
             pose,
+            ground_truth: extracted.ground_truth.clone(),
         }))
     }
 }
@@ -174,16 +207,6 @@ pub struct TalosCaptureContextShared(pub Arc<Mutex<ShmPublisher>>);
 pub struct TalosCaptureContext {
     pub publisher: Arc<Mutex<ShmPublisher>>,
     pub fov_y: f32,
-    /// 最近一次**真正写进共享内存**的图像 frame_seq，
-    /// [`NO_PUBLISHED_IMAGE`] 表示还没有发布过任何图像。
-    ///
-    /// 图像要等 GPU 回读完成才发布，实测比主世界当前帧晚约 2 帧；而真值
-    /// 只有一个槽位，等这张图落地时早就被后面两帧覆盖了，于是消费侧
-    /// `GroundTruthEvaluator::fetch()` 的同帧号校验恒不通过（实测 skew=2），
-    /// `--eval` 一个样本都取不到。这个原子量把"图像发到哪一帧了"从渲染世界
-    /// 送回主世界，真值发布系统据此从自己的短历史里挑同帧的那一批再发，
-    /// 不需要改共享内存布局，也不必给 ABI 升版本。
-    pub published_image_seq: Arc<AtomicU64>,
 }
 
 pub struct TalosCapturePlugin {
@@ -240,6 +263,7 @@ impl Plugin for TalosCapturePlugin {
         }
 
         app.add_plugins(capture)
+            .init_resource::<TalosGroundTruthFrame>()
             .insert_resource(ImageHandle(render_target_handle))
             .insert_resource(CameraFov(self.context.fov_y))
             .insert_resource(self.context.clone())
@@ -270,9 +294,19 @@ fn extract_pose_data(
         Query<(&GlobalTransform, &Transform), (With<InfantryLaunchOffset>, With<Controlled>)>,
     >,
     chassis_obs: Extract<Res<ChassisObservationFrame>>,
+    ground_truth: Extract<Res<TalosGroundTruthFrame>>,
 ) {
     pose_data.frame_seq = frame_stamp.frame_seq;
     pose_data.timestamp_ns = frame_stamp.timestamp_ns;
+
+    // 真值必须来自**同一个** frame_seq 的采集。真值采集系统在主世界的 `Last` 里跑、
+    // 本函数在紧随其后的 ExtractSchedule 里跑，正常情况下两者帧号相等；一旦不等
+    // （采集系统没跑、或调度被改动过）就当作本帧没有真值，绝不发一个错帧的批次。
+    pose_data.ground_truth = if ground_truth.frame_seq == frame_stamp.frame_seq {
+        ground_truth.batch.clone()
+    } else {
+        None
+    };
 
     let Ok(cam_transform) = camera.single() else {
         pose_data.pose = None;
@@ -312,7 +346,6 @@ fn captured_pose_data(
     timestamp_ns: u64,
 ) -> CapturedPoseData {
     let cam_rel = cam_transform.reparented_to(gimbal_transform);
-    let muzzle_rel = muzzle_global.reparented_to(gimbal_transform);
 
     let gimbal_rot = gimbal_transform.rotation()
         * muzzle_local.rotation
@@ -320,13 +353,19 @@ fn captured_pose_data(
 
     let gimbal_ros = to_ros_translation(gimbal_transform.translation());
     let gimbal_rot = to_ros_quat(gimbal_rot);
-    let muzzle = to_ros_translation(muzzle_rel.translation);
+    // 直接发枪口的世界位置，不发 reparented_to(gimbal) 的局部平移。
+    //
+    // SHOT_DIRECTION 是 GIMBAL 的子节点（见 setup.rs），所以 muzzle_global 已经是
+    // 枪口在世界系里的真实位置，这里零成本可得。发局部量的代价是消费端会写出
+    // `odom + muzzle`——把未经云台旋转的局部平移加到世界坐标上，yaw=90° 时那 0.11 m
+    // 的局部 +X 实际指向世界 +Y，误差等于偏移量全长。
+    let muzzle = to_ros_translation(muzzle_global.translation());
     let camera = to_ros_translation(cam_rel.translation);
 
     CapturedPoseData {
         gimbal_ros: [gimbal_ros.x, gimbal_ros.y, gimbal_ros.z],
         gimbal_quat: [gimbal_rot.w, gimbal_rot.x, gimbal_rot.y, gimbal_rot.z],
-        muzzle_rel: [muzzle.x, muzzle.y, muzzle.z],
+        muzzle_world: [muzzle.x, muzzle.y, muzzle.z],
         camera_rel: [camera.x, camera.y, camera.z],
         chassis_observation: ChassisObservation {
             frame_seq,
@@ -380,10 +419,12 @@ fn publish_pose_data(
         timestamp_ns,
     );
 
+    // 枪口：世界位置 + 世界姿态。姿态与 Gimbal 通道同一个量（枪管姿态），
+    // 这样消费端拿 Muzzle 一个通道就能构造完整的出膛射线，不必再去拼别的通道。
     publisher.publish_pose(
         PoseIndex::Muzzle,
-        pose.muzzle_rel,
-        [1.0, 0.0, 0.0, 0.0],
+        pose.muzzle_world,
+        pose.gimbal_quat,
         frame_seq,
         timestamp_ns,
     );

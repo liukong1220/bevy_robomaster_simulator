@@ -34,7 +34,28 @@ fn layout_abi_table_is_canonical() {
     println!("{:<52} {:>10} {:>10}", "item", "actual", "expected");
     println!("--- 常量 ---------------------------------------------------------------");
     check("SHM_MAGIC", SHM_MAGIC as usize, 0x54414C05);
-    check("SHM_VERSION", SHM_VERSION as usize, 2);
+    // v2 -> v3：ShmHeader 里从 _pad 划出 capabilities，Muzzle 通道由“相对云台的
+    // 局部平移”改为“枪口世界位置”。两者都是**语义**变更而非布局变更，靠版本号
+    // 而不是靠尺寸差异来拒绝老发布端。
+    check("SHM_VERSION", SHM_VERSION as usize, 3);
+    check("CAP_GROUND_TRUTH", CAP_GROUND_TRUTH as usize, 1);
+    check("CAP_MUZZLE_WORLD_POSE", CAP_MUZZLE_WORLD_POSE as usize, 2);
+    check(
+        "CAP_CHASSIS_OBSERVATION",
+        CAP_CHASSIS_OBSERVATION as usize,
+        4,
+    );
+    check("CAP_RUNTIME_STATE", CAP_RUNTIME_STATE as usize, 8);
+    check(
+        "SIMULATOR_CAPABILITIES",
+        SIMULATOR_CAPABILITIES as usize,
+        0b1111,
+    );
+    check(
+        "GROUND_TRUTH_PAYLOAD_BYTES",
+        GROUND_TRUTH_PAYLOAD_BYTES,
+        1600,
+    );
     check("IMAGE_WIDTH", IMAGE_WIDTH as usize, 1440);
     check("IMAGE_HEIGHT", IMAGE_HEIGHT as usize, 1080);
     check("IMAGE_CHANNELS", IMAGE_CHANNELS as usize, 3);
@@ -44,6 +65,24 @@ fn layout_abi_table_is_canonical() {
     check("INDEX_MASK", INDEX_MASK as usize, 0x03);
     check("GROUND_TRUTH_MAX_TARGETS", GROUND_TRUTH_MAX_TARGETS, 16);
     check("GROUND_TRUTH_MAX_RUNES", GROUND_TRUTH_MAX_RUNES, 4);
+    // C++ 侧这三个是具名常量（IMAGE_SLOT_COUNT / TRIPLE_SLOT_COUNT /
+    // POSE_CHANNEL_COUNT），Rust 侧只体现为数组长度。这里按同名打印，
+    // 逐行对照才不会漏掉“一边 3 槽一边 4 槽”这类只在 sizeof 里间接暴露的错。
+    check(
+        "IMAGE_SLOT_COUNT",
+        ImageTripleBuffer::default().slots.len(),
+        3,
+    );
+    check(
+        "TRIPLE_SLOT_COUNT",
+        PoseTripleBuffer::default().slots.len(),
+        3,
+    );
+    check(
+        "POSE_CHANNEL_COUNT",
+        ShmMetaRegion::default().poses.len(),
+        5,
+    );
     check("PoseIndex::Gimbal", PoseIndex::Gimbal as usize, 0);
     check("PoseIndex::Odom", PoseIndex::Odom as usize, 1);
     check("PoseIndex::Muzzle", PoseIndex::Muzzle as usize, 2);
@@ -193,6 +232,13 @@ fn layout_abi_table_is_canonical() {
     );
 
     check("ShmHeader::magic offset", offset_of!(ShmHeader, magic), 0);
+    // capabilities 必须落在原 _pad 的起始处（32），否则 v2 的其余偏移会整体平移，
+    // C++ 侧手写镜像就会与 Rust 侧错开。
+    check(
+        "ShmHeader::capabilities offset",
+        offset_of!(ShmHeader, capabilities),
+        32,
+    );
     check(
         "ShmHeader::version offset",
         offset_of!(ShmHeader, version),
@@ -314,6 +360,12 @@ fn layout_abi_table_is_canonical() {
         "GroundTruthBatch::runes offset",
         offset_of!(GroundTruthBatch, runes),
         1088,
+    );
+    // seqlock 的偏移就是 payload 长度：两端拷贝时都只拷这段前缀，标记本身只做原子访问。
+    check(
+        "GroundTruthBatch::seqlock offset",
+        offset_of!(GroundTruthBatch, seqlock),
+        1600,
     );
 
     check(

@@ -13,8 +13,15 @@ pub struct ShmPublisher {
 
 impl ShmPublisher {
     pub fn create() -> Result<Self, ShmError> {
-        let mut meta_region = ShmRegion::create(SHM_NAME_META, size_of::<ShmMetaRegion>())?;
-        let image_pool = ShmRegion::create(SHM_NAME_IMAGE_POOL, IMAGE_POOL_SIZE)?;
+        Self::create_named(SHM_NAME_META, SHM_NAME_IMAGE_POOL)
+    }
+
+    /// 用显式的区域名创建。仿真器本体永远走 [`Self::create`]（固定名字才能被
+    /// 消费端找到）；测试必须用这个：固定名字会与本机正在跑的仿真器互相覆盖，
+    /// 并行跑的两个测试之间也会互相踩。
+    pub fn create_named(meta_name: &str, image_pool_name: &str) -> Result<Self, ShmError> {
+        let mut meta_region = ShmRegion::create(meta_name, size_of::<ShmMetaRegion>())?;
+        let image_pool = ShmRegion::create(image_pool_name, IMAGE_POOL_SIZE)?;
 
         unsafe {
             let meta = meta_region.as_mut::<ShmMetaRegion>();
@@ -27,7 +34,10 @@ impl ShmPublisher {
                 heartbeat_ns: Self::now_ns(),
                 image_width: IMAGE_WIDTH,
                 image_height: IMAGE_HEIGHT,
-                _pad: [0; 32],
+                // 仿真器本体一定会发布真值/世界枪口位姿/底盘观测/运行状态：
+                // `TalosPlugin::build` 无条件注册了这几个 system。
+                capabilities: SIMULATOR_CAPABILITIES,
+                _pad: [0; 28],
             };
 
             // 初始化所有 TripleBuffer (CRITICAL: 零填充破坏了正确的初始状态)
@@ -194,32 +204,43 @@ impl ShmPublisher {
         }
     }
 
-    /// seqlock 提交真值批次。
+    /// 发布真值（seqlock 写端）：奇数 = 正在写，偶数 = 稳定。
     ///
-    /// 之前是直接整块赋值，消费端只能靠"memcpy 前后读到同一个 frame_seq"来猜这份
-    /// 拷贝是否完整——那不是同步保证：同一帧号内重发时 frame_seq 根本不变，
-    /// targets[] 却在被改写，消费端会拿到半新半旧的一批目标；反过来编译器/CPU
-    /// 也可以先写 frame_seq 再写 body。
+    /// 消费端原来只能靠"memcpy 前后读到同一个 frame_seq"来猜这份拷贝是否完整，
+    /// 那不是同步保证：同一帧号内重发时 frame_seq 根本不变，targets[] 却在被改写，
+    /// 消费端会拿到半新半旧的一批目标；反过来编译器/CPU 也可以先写 frame_seq
+    /// 再写 body。
     ///
-    /// 现在是标准 seqlock：奇数 = 正在写，偶数 = 稳定。序号本身在 body 之内，
-    /// 所以整块赋值前先把它填成本次的奇数序号，避免 body 写入过程中序号短暂变回
-    /// 别的值（那会让消费端的前后比较意外通过）。
+    /// 标记只用原子读写访问，payload 只拷 [`GROUND_TRUTH_PAYLOAD_BYTES`] 字节的
+    /// 前缀，两者互不重叠。原来是 `meta.ground_truth = staged;` 整块赋值，那一次
+    /// 非原子写会跨过标记：既与读端对同一个原子变量的并发访问构成数据竞争，又把
+    /// 刚置好的奇数标记覆盖成 `staged.seqlock`。后者在这里恰好等于 `begin`，所以
+    /// 看起来"能用"——但它靠的是写端手工维持两个副本一致，而不是 seqlock 协议本身，
+    /// 编译器也完全可以把这次结构体赋值拆分或重排。
     pub fn publish_ground_truth(&mut self, batch: &GroundTruthBatch) {
         unsafe {
             let meta = self.meta_region.as_mut::<ShmMetaRegion>();
+            let slot = core::ptr::addr_of_mut!(meta.ground_truth);
             let seq = &*(core::ptr::addr_of!(meta.ground_truth.seqlock) as *const AtomicU32);
 
-            // 上一次提交后的序号一定是偶数（初始 0 也是偶数）。
+            // 奇数 = 正在写。上一次提交后一定是偶数（初始 0 也是偶数）。
             let begin = seq.load(Ordering::Relaxed).wrapping_add(1) | 1;
             seq.store(begin, Ordering::Release);
 
-            // body 的写入不允许被重排到 begin 之前。
-            core::sync::atomic::fence(Ordering::Release);
-            let mut staged = *batch;
-            staged.seqlock = begin;
-            meta.ground_truth = staged;
+            // 这道 fence 不能省：Release **store** 只阻止之前的写往后跑，不阻止
+            // 之后的写往前跑。少了它，payload 的写可以先于奇数标记可见，读端就会
+            // 看到偶数标记 + 撕裂 payload + 同一个偶数标记，前后比较照样通过。
+            // 等价于内核 seqlock 写端 `sequence++; smp_wmb();` 里的那个屏障。
             core::sync::atomic::fence(Ordering::Release);
 
+            core::ptr::copy_nonoverlapping(
+                (batch as *const GroundTruthBatch).cast::<u8>(),
+                slot.cast::<u8>(),
+                GROUND_TRUTH_PAYLOAD_BYTES,
+            );
+
+            // 偶数 = 写完。payload 必须先于标记递增对读端可见。
+            core::sync::atomic::fence(Ordering::Release);
             seq.store(begin.wrapping_add(1), Ordering::Release);
         }
     }

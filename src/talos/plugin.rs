@@ -6,14 +6,14 @@ use crate::components::{
 use crate::config::SimulationConfig;
 use crate::systems::projectile_launch;
 use crate::talos::capture::{
-    NO_PUBLISHED_IMAGE, TalosCaptureContext, TalosCapturePlugin, TalosFrameStamp,
-    advance_talos_frame_stamp, publish_talos_runtime_state_system,
+    TalosCaptureContext, TalosCapturePlugin, TalosFrameStamp, advance_talos_frame_stamp,
+    publish_talos_runtime_state_system,
 };
 use bevy::ecs::system::RunSystemOnce;
 use bevy::image::BevyDefault;
 use bevy::prelude::*;
 use bevy::render::render_resource::TextureFormat;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use talos_ipc::*;
 
@@ -22,6 +22,21 @@ pub struct ShmSubscriberRes(pub Arc<Mutex<ShmSubscriber>>);
 
 #[derive(Resource, Deref, DerefMut)]
 pub struct TalosEnabled(pub AtomicBool);
+
+/// 外部云台命令的到达情况，只给 HUD 和日志用，不参与任何算法。
+///
+/// `SubscribeAutoAim` 打开后 `gimbal_controls` 直接 return，云台完全交给
+/// `process_subscription` 吃共享内存里的 `gimbal_cmd`。此时如果视觉侧没启动、
+/// 或者跑的是 `--mode=passive`（按设计永不下发控制），云台就一动不动，而 HUD
+/// 只写着"自瞄=开"——看起来就是"自瞄开了但不锁不跟"，方向键也同时是死的，
+/// 极容易被当成自瞄算法的问题。所以把"到底有没有收到命令"显式显示出来。
+#[derive(Resource, Default)]
+pub struct AutoAimLink {
+    /// 收到过的命令总数（含 `distance_m == -1` 的安全停止）。
+    pub cmd_count: u64,
+    /// 最近一次收到命令的时刻，按 `Time::elapsed_secs` 记。
+    pub last_cmd_secs: Option<f32>,
+}
 
 pub struct TalosPluginConfig {
     pub width: u32,
@@ -72,7 +87,6 @@ impl Plugin for TalosPlugin {
         let capture_context = TalosCaptureContext {
             publisher: publisher.clone(),
             fov_y: self.config.fov_y,
-            published_image_seq: Arc::new(AtomicU64::new(NO_PUBLISHED_IMAGE)),
         };
 
         app.init_resource::<TalosFrameStamp>();
@@ -93,14 +107,18 @@ impl Plugin for TalosPlugin {
         }
 
         app.insert_resource(TalosEnabled(AtomicBool::new(true)));
+        app.init_resource::<AutoAimLink>();
         app.add_systems(Last, (advance_talos_frame_stamp, heartbeat_system));
         app.add_systems(
             Last,
             publish_talos_runtime_state_system.after(advance_talos_frame_stamp),
         );
+        // 真值采集必须在帧戳自增之后：它写进 TalosGroundTruthFrame 的 frame_seq
+        // 要与本帧图像、同帧姿态用的是同一个号，紧随其后的 ExtractSchedule 会核对。
         app.add_systems(
             Last,
-            crate::talos::ground_truth::publish_ground_truth_system
+            crate::talos::ground_truth::collect_ground_truth_system
+                .after(advance_talos_frame_stamp)
                 .after(publish_talos_runtime_state_system),
         );
         app.add_systems(
@@ -114,6 +132,8 @@ impl Plugin for TalosPlugin {
 fn process_subscription(
     context: Option<Res<ShmSubscriberRes>>,
     mut commands: Commands,
+    time: Res<Time>,
+    mut link: ResMut<AutoAimLink>,
     gimbal: Single<
         (&mut Transform, &mut InfantryGimbal),
         (
@@ -135,6 +155,11 @@ fn process_subscription(
     let Some(cmd) = recv_gimbal_cmd(&ctx) else {
         return;
     };
+    // 安全停止（distance_m == -1）也算"链路活着"：它同样是视觉侧发过来的命令，
+    // 只是内容是"别动"。把它排除在计数外，HUD 就会在安全停止期间显示"无命令"，
+    // 与"视觉侧没启动"混为一谈。
+    link.cmd_count += 1;
+    link.last_cmd_secs = Some(time.elapsed_secs());
     if cmd.distance_m == -1.0 {
         return;
     }

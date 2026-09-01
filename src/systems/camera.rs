@@ -1,10 +1,11 @@
 use bevy::input::mouse::MouseMotion;
 use bevy::prelude::*;
+use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use core::f32::consts::PI;
 
 use crate::components::{
     CameraMode, Controlled, FollowingType, Infantry, InfantryGimbal, InfantryLaunchOffset,
-    InfantryViewOffset, MainCamera,
+    InfantryViewOffset, MainCamera, MouseCapture,
 };
 use crate::config::SimulationConfig;
 use crate::systems::ControllerState;
@@ -107,6 +108,53 @@ pub fn update_camera_follow(
             camera_transform.look_at(base_transform.translation, Vec3::Y);
         }
         FollowingType::Free => {}
+    }
+}
+
+/// 左键捕获鼠标 / Esc 释放，并把捕获状态同步到窗口。
+///
+/// 不捕获时指针会撞到屏幕边缘，`MouseMotion` 随之停下，视角只能转一小段就卡住；
+/// 所以"鼠标能瞄准"必须连着光标捕获一起做，只加事件读取是不够的。
+///
+/// 反过来也不能一启动就捕获：那样窗口一获得焦点指针就被锁住，调 egui inspector
+/// 或者切到别的窗口都要先想起按 Esc。这里用显式的左键 / Esc，HUD 里写明。
+pub fn update_cursor_capture(
+    mouse_button: Res<ButtonInput<MouseButton>>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut capture: ResMut<MouseCapture>,
+    cursor: Option<Single<&mut CursorOptions, With<PrimaryWindow>>>,
+) {
+    let mut want = capture.captured;
+    if keyboard.just_pressed(KeyCode::Escape) {
+        want = false;
+    } else if mouse_button.just_pressed(MouseButton::Left) {
+        want = true;
+    }
+
+    let Some(cursor) = cursor else {
+        // 无窗口（离屏采集）时只记状态，不去写不存在的 CursorOptions。
+        capture.captured = want;
+        return;
+    };
+    let mut cursor = cursor.into_inner();
+
+    if want != capture.captured {
+        capture.captured = want;
+    }
+    // 每帧对齐一次而不是只在切换时写：窗口失焦时 winit 会自己把 grab 放掉，
+    // 只在边沿写的话回到窗口后状态就和 `capture.captured` 不一致了。
+    // X11 不支持 Locked，bevy 内部会退化成 Confined。
+    let grab_mode = if capture.captured {
+        CursorGrabMode::Locked
+    } else {
+        CursorGrabMode::None
+    };
+    if cursor.grab_mode != grab_mode {
+        cursor.grab_mode = grab_mode;
+    }
+    let visible = !capture.captured;
+    if cursor.visible != visible {
+        cursor.visible = visible;
     }
 }
 
