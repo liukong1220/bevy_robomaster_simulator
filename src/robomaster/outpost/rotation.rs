@@ -59,11 +59,17 @@ impl RotationController {
         transform.rotate_y(angle);
     }
 
+    /// 当前有符号角速度，rad/s，绕 **Bevy 局部 +Y**。
+    ///
+    /// 提出来是为了让真值发布的 vyaw 与场景实际转动同源：[`Self::step`] 现在也走
+    /// 这个表达式，所以改了转速常量或旋向之后，画面转速和真值 vyaw 一起变，不会
+    /// 出现"真值说在转、画面没转"这种只能靠肉眼发现的分叉。
+    pub fn signed_speed(&self, mode: RotationMode) -> f32 {
+        self.direction.sign() * mode.scale() * self.speed
+    }
+
     pub fn step(&self, transform: &mut Transform, dt: f32, mode: RotationMode) {
-        self.rotate(
-            transform,
-            self.direction.sign() * mode.scale() * self.speed * dt,
-        );
+        self.rotate(transform, self.signed_speed(mode) * dt);
     }
 }
 
@@ -75,6 +81,31 @@ mod tests {
     fn rotation_direction_sign_matches_legacy_bool() {
         assert_eq!(RotationDirection::Clockwise.sign(), 1.0);
         assert_eq!(RotationDirection::CounterClockwise.sign(), -1.0);
+    }
+
+    /// `signed_speed` 必须与 `step` 实际转的角一致——真值 vyaw 用的是前者，
+    /// 画面转的是后者，两者一旦分叉，评估端会拿一个不存在的角速度去算预测误差。
+    #[test]
+    fn signed_speed_matches_what_step_actually_rotates() {
+        for (direction, mode) in [
+            (RotationDirection::Clockwise, RotationMode::Forward),
+            (RotationDirection::Clockwise, RotationMode::Reverse),
+            (RotationDirection::CounterClockwise, RotationMode::Forward),
+            (RotationDirection::CounterClockwise, RotationMode::Stopped),
+        ] {
+            let c = RotationController::new(direction);
+            let dt = 0.01;
+            let mut t = Transform::IDENTITY;
+            c.step(&mut t, dt, mode);
+            // rotate_y(θ) 绕 +Y 转 θ：从四元数取回带符号的角。
+            let (axis, angle) = t.rotation.to_axis_angle();
+            let signed = angle * axis.y.signum();
+            let expected = c.signed_speed(mode) * dt;
+            assert!(
+                (signed - expected).abs() < 1e-6,
+                "{direction:?}/{mode:?}: step 转了 {signed}，signed_speed 说 {expected}"
+            );
+        }
     }
 
     #[test]

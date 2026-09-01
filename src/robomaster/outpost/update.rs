@@ -32,7 +32,7 @@ impl Outpost {
         self.team
     }
 
-    pub(super) fn new(team: Team) -> Self {
+    pub(crate) fn new(team: Team) -> Self {
         Self { team }
     }
 }
@@ -48,10 +48,21 @@ impl OutpostRotator {
             rotation: RotationController::new(direction),
         }
     }
+
+    /// 绕 **Bevy 局部 +Y** 的有符号角速度，rad/s。真值发布用它算 vyaw。
+    ///
+    /// 不做数值差分：差分要缓存上一帧的 yaw 和时间戳，在变步长下噪声与真实
+    /// 转速同阶，而这里的转速本来就是解析已知的。解析取值还能正确报出
+    /// `Stopped` 时的 0，差分在停转的第一帧会给出一个残留值。
+    pub fn signed_yaw_rate(&self, mode: RotationMode) -> f32 {
+        self.rotation.signed_speed(mode)
+    }
 }
 
+/// 前哨站转动模式。真值发布要读它才能算出当前 vyaw（Shift+C 可以在运行时切换到
+/// Stopped/Reverse），所以对 crate 公开。
 #[derive(Resource, Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
-struct OutpostRotationMode(RotationMode);
+pub struct OutpostRotationMode(pub RotationMode);
 
 fn debug_cycle_outpost_rotation(
     keyboard: Res<ButtonInput<KeyCode>>,

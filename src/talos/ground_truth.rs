@@ -1,8 +1,8 @@
 use crate::capture::CaptureSource;
 use crate::components::{Controlled, Infantry};
 use crate::robomaster::prelude::{
-    Activation, Armor, ArmorRoot, MechanismState, PowerRune, PowerRuneMechanism, PowerRuneRotation,
-    RuneMode, Team,
+    Activation, Armor, ArmorLabel, ArmorRoot, MechanismState, Outpost, OutpostRotationMode,
+    OutpostRotator, PowerRune, PowerRuneMechanism, PowerRuneRotation, RotationMode, RuneMode, Team,
 };
 use crate::talos::capture::{TalosCaptureContext, TalosFrameStamp, TalosGroundTruthFrame};
 use crate::talos::plugin::M_ALIGN_MAT3;
@@ -55,24 +55,47 @@ fn rune_mode_to_u8(m: &RuneMode) -> u8 {
 fn ros_yaw(global_tf: &GlobalTransform) -> f32 {
     let align_quat = Quat::from_mat3(&M_ALIGN_MAT3);
     let ros_rot = align_quat * global_tf.rotation() * align_quat.inverse();
-    let (_, _, yaw) = ros_rot.to_euler(EulerRot::ZYX);
+    // `EulerRot::ZYX` 按指定轴序返回 `(z, y, x)` 三个分量。ROS yaw 是绕 Z，
+    // 所以必须取第一个；第三个是绕 X 的 roll。取错时纯 yaw 转动会一直报 0，
+    // 车辆与前哨站的 yaw/vyaw 评估都会静默失真。
+    let (yaw, _, _) = ros_rot.to_euler(EulerRot::ZYX);
     yaw
 }
 
-/// 从整车实体找到"自瞄真正会瞄的那块装甲板"的板心世界位置（ROS 系）。
+/// 板位参考点的取法。两类资产的节点结构不同，不能用同一条路径。
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum PlateReference {
+    /// 必须有 `*CENTER` 后代节点，取不到就跳过这块板。
+    ///
+    /// 步兵/英雄走这条：`assets/vehicle.glb` 里每块板都有 `<n>_ARMOR_CENTER`。
+    /// 缺一个说明资产换了节点名或子树没加载完，此时"退回板根"会静默给出一个不是
+    /// 板心的点，宁可少发这一块板，让消费端从 `armor_position_valid` 看出来。
+    CenterNode,
+    /// 没有 `*CENTER` 后代时退回板根节点自己。
+    ///
+    /// 前哨站走这条：`assets/OUTPOST.glb` 里 `*CENTER` 节点数是 **0**（实测遍历
+    /// 全部 glTF 节点），板根 `A/B/C_ARMOR_ROOT` 直接落在板位上——相对旋转节点
+    /// `OUTPOST_A_ROTATE` 的水平半径实测 0.2757 / 0.2753 / 0.2748 m，互差 <1 mm，
+    /// 三块板 120° 分布。对照组：`vehicle.glb` 的 `1_ARMOR_CENTER` 局部平移是恒等，
+    /// 也就是说步兵的板根与板心本来就重合，这个退化没有引入新的口径。
+    CenterNodeOrPlateRoot,
+}
+
+/// 找到"自瞄真正会瞄的那块装甲板"的板位世界位置（ROS 系）。
 ///
 /// 为什么需要它：真值里的 `position` 是整车中心，而自瞄解算出来、planner 追的是
 /// 装甲板板心。步兵四块板呈盒状分布，板心偏心半径约 0.2m、比车心高约 0.06m，
 /// 1.5m 距离上折算成 2 度量级的固定几何差。消费端拿整车中心算瞄准误差，会把
 /// 这段几何差整个算进"闭环残差"，得出的数字既不是估计误差也不是控制误差。
 ///
-/// 选板依据：板心距相机最近。四块板在凸壳上，朝向观察者的那块必然是最近的一块，
+/// 选板依据：板位距相机最近。四块板在凸壳上，朝向观察者的那块必然是最近的一块，
 /// 这与自瞄"只能看见朝向自己的板"一致。这是几何代理而非复现自瞄的选板逻辑
 /// （自瞄按图像里的检测结果和 Tracker 的 armor id 选板），所以两者在换板瞬间
 /// 可能不一致——评估侧必须把这一点当作已知误差来源，不能当成闭环精度。
-fn select_armor_center(
-    vehicle: Entity,
+fn select_plate_reference(
+    root: Entity,
     camera_pos: Vec3,
+    reference: PlateReference,
     qq: &HierarchyQuery,
     armor_roots: &Query<(Entity, &Armor), With<ArmorRoot>>,
     transforms: &Query<&GlobalTransform>,
@@ -80,11 +103,13 @@ fn select_armor_center(
     let mut best: Option<(f32, Vec3)> = None;
 
     for (plate, _armor) in armor_roots.iter() {
-        // 这块板属于哪辆车：沿父链找，与 armor/collision.rs 里判定命中的写法一致。
+        // 这块板属于哪个目标：沿父链找，与 armor/collision.rs 里判定命中的写法一致。
+        // 前哨站的板挂在旋转节点下，旋转节点又挂在前哨站根下，所以同一条祖先链判定
+        // 对两类资产都成立。
         if !qq
             .child_of
             .iter_ancestors(plate)
-            .any(|ancestor| ancestor == vehicle)
+            .any(|ancestor| ancestor == root)
         {
             continue;
         }
@@ -96,16 +121,19 @@ fn select_armor_center(
         // 一块板缺 CENTER（资产换了节点名、或该板的子树还没加载完）就会让整车的板心
         // 真值全部消失，消费端只能退回整车中心，误差里凭空多出 2 度量级的几何偏差。
         // 缺板必须只跳过这一块板。
-        let Some(center) = qq
+        let center = qq
             .of(plate)
             .suffix("CENTER")
             .any()
             .one()
-            .or_else(|| qq.of(plate).suffix("CENTER").one())
-        else {
-            continue;
+            .or_else(|| qq.of(plate).suffix("CENTER").one());
+        let node = match (center, reference) {
+            (Some(center), _) => center,
+            // 这份资产就是没有 CENTER 节点，板根即板位（见 `PlateReference` 的实测）。
+            (None, PlateReference::CenterNodeOrPlateRoot) => plate,
+            (None, PlateReference::CenterNode) => continue,
         };
-        let Ok(center_tf) = transforms.get(center) else {
+        let Ok(center_tf) = transforms.get(node) else {
             continue;
         };
 
@@ -117,6 +145,81 @@ fn select_armor_center(
     }
 
     best.map(|(_, world)| to_ros_vec3(world))
+}
+
+/// 把场景里的前哨站写进真值批次。
+///
+/// 单独成函数是为了能被单测直接驱动：`collect_ground_truth_system` 需要
+/// `TalosCaptureContext`，而它持有真实的共享内存发布器，不适合在单测里构造。
+#[allow(clippy::too_many_arguments)]
+fn push_outpost_targets(
+    batch: &mut GroundTruthBatch,
+    frame_seq: u64,
+    timestamp_ns: u64,
+    camera_pos: Option<Vec3>,
+    outpost_mode: RotationMode,
+    qq: &HierarchyQuery,
+    outpost_query: &Query<(Entity, &Outpost)>,
+    outpost_rotors: &Query<(Entity, &OutpostRotator, &GlobalTransform)>,
+    armor_roots: &Query<(Entity, &Armor), With<ArmorRoot>>,
+    transforms: &Query<&GlobalTransform>,
+) {
+    // ---- 前哨站真值 -------------------------------------------------------------
+    //
+    // 为什么发的是"转动节点"而不是前哨站根节点：根节点是静止的安装基座，自瞄侧
+    // 的前哨站解算要估的是那个 0.275 m 半径圆周运动的**回转中心与相位**。回转轴
+    // 正好过转动节点的原点（`rotate_y` 作用在它的局部 Transform 上），所以
+    // position / yaw / vyaw 三个量取自同一个节点，彼此自洽；取根节点的话 yaw 恒为
+    // 常数，vyaw 会变成一个无处对应的数。
+    //
+    // vyaw 的符号：`M_ALIGN_MAT3` 是行列式 +1 的真旋转，且把 Bevy 的 +Y 映到 ROS
+    // 的 +Z，所以"绕 Bevy 局部 +Y 转 θ"conjugate 之后就是"绕 ROS +Z 转 θ"，与
+    // `ros_yaw` 取出的 yaw 同一个符号约定，直接搬过来即可（有单测钉住）。
+    for (rotor, rotator, rotor_tf) in outpost_rotors.iter() {
+        if (batch.target_count as usize) >= GROUND_TRUTH_MAX_TARGETS {
+            break;
+        }
+        let Some((outpost_root, outpost)) = qq
+            .child_of
+            .iter_ancestors(rotor)
+            .find_map(|ancestor| outpost_query.get(ancestor).ok())
+        else {
+            continue;
+        };
+
+        let pos_ros = to_ros_vec3(rotor_tf.translation());
+        let team = outpost.team();
+
+        // 板位：三块板里距相机最近的那一块。OUTPOST.glb 没有 CENTER 节点，
+        // 退回板根（见 `PlateReference::CenterNodeOrPlateRoot` 的实测依据）。
+        let armor = camera_pos.and_then(|camera_pos| {
+            select_plate_reference(
+                outpost_root,
+                camera_pos,
+                PlateReference::CenterNodeOrPlateRoot,
+                qq,
+                armor_roots,
+                transforms,
+            )
+        });
+
+        let idx = batch.target_count as usize;
+        batch.targets[idx] = GroundTruthTarget {
+            frame_seq,
+            timestamp_ns,
+            team: team_to_u8(&team),
+            armor_label: ArmorLabel::Outpost as u8,
+            is_outpost: 1,
+            _pad1: 0,
+            position: [pos_ros.x, pos_ros.y, pos_ros.z],
+            vyaw: rotator.signed_yaw_rate(outpost_mode),
+            yaw: ros_yaw(rotor_tf),
+            armor_position: armor.map(|a| [a.x, a.y, a.z]).unwrap_or([0.0; 3]),
+            armor_position_valid: u8::from(armor.is_some()),
+            _pad: [0; 11],
+        };
+        batch.target_count += 1;
+    }
 }
 
 /// 采集本帧真值，写进 [`TalosGroundTruthFrame`]，**不**自己发布。
@@ -155,6 +258,11 @@ pub fn collect_ground_truth_system(
     armor_roots: Query<(Entity, &Armor), With<ArmorRoot>>,
     transforms: Query<&GlobalTransform>,
     qq: HierarchyQuery,
+    // 前哨站：队伍/旋向在根节点（`OutpostRoot` -> `Outpost`），转动在名字带 ROTATE
+    // 的后代节点上（`OutpostRotator`）。两者分开查，靠祖先链关联。
+    outpost_query: Query<(Entity, &Outpost)>,
+    outpost_rotors: Query<(Entity, &OutpostRotator, &GlobalTransform)>,
+    outpost_mode: Option<Res<OutpostRotationMode>>,
     rune_query: Query<(
         &GlobalTransform,
         &Transform,
@@ -224,15 +332,33 @@ pub fn collect_ground_truth_system(
 
     if let Some(camera_pos) = camera_pos {
         for (vehicle, idx) in slot_of.iter() {
-            if let Some(center_ros) =
-                select_armor_center(*vehicle, camera_pos, &qq, &armor_roots, &transforms)
-            {
+            if let Some(center_ros) = select_plate_reference(
+                *vehicle,
+                camera_pos,
+                PlateReference::CenterNode,
+                &qq,
+                &armor_roots,
+                &transforms,
+            ) {
                 let t = &mut batch.targets[*idx];
                 t.armor_position = [center_ros.x, center_ros.y, center_ros.z];
                 t.armor_position_valid = 1;
             }
         }
     }
+
+    push_outpost_targets(
+        &mut batch,
+        frame_seq,
+        timestamp_ns,
+        camera_pos,
+        outpost_mode.map(|m| m.0).unwrap_or_default(),
+        &qq,
+        &outpost_query,
+        &outpost_rotors,
+        &armor_roots,
+        &transforms,
+    );
 
     // Collect rune ground truth
     for (global_tf, local_tf, power_rune, mechanism, rotation) in rune_query.iter() {
@@ -371,7 +497,14 @@ mod tests {
                 move |qq: HierarchyQuery,
                       armor_roots: Query<(Entity, &Armor), With<ArmorRoot>>,
                       transforms: Query<&GlobalTransform>| {
-                    select_armor_center(vehicle, camera_pos, &qq, &armor_roots, &transforms)
+                    select_plate_reference(
+                        vehicle,
+                        camera_pos,
+                        PlateReference::CenterNode,
+                        &qq,
+                        &armor_roots,
+                        &transforms,
+                    )
                 },
             )
             .expect("system 运行失败");
@@ -382,6 +515,222 @@ mod tests {
             got.distance(expected) < 1e-6,
             "应选中最近的那块板心 {expected:?}，实际 {got:?}"
         );
+    }
+
+    /// 搭一座前哨站：根节点带 `Outpost`，转动节点带 `OutpostRotator`，三块板挂在
+    /// 转动节点下且**没有** CENTER 子节点（与 `assets/OUTPOST.glb` 一致）。
+    fn spawn_outpost(
+        world: &mut World,
+        team: Team,
+        rotor_at: Vec3,
+        plate_offsets: &[Vec3],
+        id_base: usize,
+    ) -> (Entity, Entity) {
+        use crate::robomaster::prelude::{ArmorId, ArmorSpec, RotationDirection, SmallArmorLabel};
+
+        let root = world
+            .spawn((Outpost::new(team), GlobalTransform::default()))
+            .id();
+        // 旋向与 `setup_outpost` 一致：红方顺时针、蓝方逆时针。
+        let direction = match team {
+            Team::Red => RotationDirection::Clockwise,
+            Team::Blue => RotationDirection::CounterClockwise,
+        };
+        let rotor = world
+            .spawn((
+                OutpostRotator::new(direction),
+                Transform::from_translation(rotor_at),
+                GlobalTransform::from_translation(rotor_at),
+            ))
+            .id();
+        world.entity_mut(root).add_child(rotor);
+
+        for (i, off) in plate_offsets.iter().enumerate() {
+            let plate = world
+                .spawn((
+                    Armor {
+                        name: format!("{i}_ARMOR_ROOT"),
+                        team,
+                        spec: ArmorSpec::Small(SmallArmorLabel::Outpost),
+                        label: ArmorLabel::Outpost,
+                    },
+                    ArmorRoot {
+                        id: ArmorId::from_raw_for_test(id_base + i),
+                    },
+                    GlobalTransform::from_translation(rotor_at + *off),
+                ))
+                .id();
+            world.entity_mut(rotor).add_child(plate);
+        }
+        (root, rotor)
+    }
+
+    fn collect_outposts(world: &mut World, camera_pos: Option<Vec3>) -> GroundTruthBatch {
+        use bevy::ecs::system::RunSystemOnce;
+
+        world
+            .run_system_once(
+                move |qq: HierarchyQuery,
+                      outpost_query: Query<(Entity, &Outpost)>,
+                      outpost_rotors: Query<(Entity, &OutpostRotator, &GlobalTransform)>,
+                      armor_roots: Query<(Entity, &Armor), With<ArmorRoot>>,
+                      transforms: Query<&GlobalTransform>| {
+                    let mut b = GroundTruthBatch::default();
+                    push_outpost_targets(
+                        &mut b,
+                        7,
+                        1_234_567_890,
+                        camera_pos,
+                        RotationMode::Forward,
+                        &qq,
+                        &outpost_query,
+                        &outpost_rotors,
+                        &armor_roots,
+                        &transforms,
+                    );
+                    b
+                },
+            )
+            .expect("system 运行失败")
+    }
+
+    /// 红蓝两座前哨站都必须出现在真值批次里，且靠 `team` 区分。
+    ///
+    /// 改动前 `is_outpost` 硬编码 0、前哨站根本不进 `targets[]`，C++ 端
+    /// `GroundTruthEvaluator::find_by_label(6, ...)` 恒 0 命中，报告里
+    /// `ground_truth.count=0`、`aim_error` 整段缺失——看起来像"评估没开"，
+    /// 实际是"没有可评估的目标"。
+    #[test]
+    fn red_and_blue_outposts_are_published_with_team_and_outpost_label() {
+        const R: f32 = 0.2757; // OUTPOST.glb 实测板位半径
+        let plates = [
+            Vec3::new(R, -0.138, 0.0),
+            Vec3::new(-0.5 * R, -0.138, 0.866 * R),
+            Vec3::new(-0.5 * R, -0.138, -0.866 * R),
+        ];
+
+        let mut world = World::new();
+        let red_rotor_at = Vec3::new(3.06, 1.14, -5.50);
+        let blue_rotor_at = Vec3::new(-3.06, 1.14, 2.21);
+        spawn_outpost(&mut world, Team::Red, red_rotor_at, &plates, 0);
+        spawn_outpost(&mut world, Team::Blue, blue_rotor_at, &plates, 10);
+
+        // 相机放在红方前哨站的 +X 侧，第一块板应当是最近的那块。
+        let camera_pos = red_rotor_at + Vec3::new(3.0, 0.0, 0.0);
+        let batch = collect_outposts(&mut world, Some(camera_pos));
+
+        assert_eq!(batch.target_count, 2, "红蓝两座前哨站都要发");
+        let mut by_team = [None, None];
+        for t in &batch.targets[..2] {
+            assert_eq!(t.is_outpost, 1, "前哨站必须置 is_outpost=1");
+            assert_eq!(t.armor_label, 6, "前哨站 armor_label 必须是 Outpost=6");
+            assert_eq!(t.frame_seq, 7);
+            assert_eq!(t.timestamp_ns, 1_234_567_890);
+            by_team[t.team as usize] = Some(*t);
+        }
+        let red = by_team[0].expect("缺红方前哨站（team=0）");
+        let blue = by_team[1].expect("缺蓝方前哨站（team=1）");
+
+        // 位置 = 转动节点的世界位置（回转中心），换算到 ROS 系。
+        for (t, at) in [(&red, red_rotor_at), (&blue, blue_rotor_at)] {
+            let want = to_ros_vec3(at);
+            let got = Vec3::from_array(t.position);
+            assert!(
+                got.distance(want) < 1e-5,
+                "位置应是回转中心 {want:?}，实际 {got:?}"
+            );
+        }
+
+        // vyaw：同一个转速常量、旋向相反。
+        let speed = 0.8 * std::f32::consts::PI;
+        assert!(
+            (red.vyaw - speed).abs() < 1e-5,
+            "红方 vyaw 应为 +{speed}，实际 {}",
+            red.vyaw
+        );
+        assert!(
+            (blue.vyaw + speed).abs() < 1e-5,
+            "蓝方 vyaw 应为 -{speed}，实际 {}",
+            blue.vyaw
+        );
+
+        // 板位：OUTPOST.glb 没有 CENTER 节点，必须退回板根而不是判成"板位不可用"。
+        assert_eq!(
+            red.armor_position_valid, 1,
+            "前哨站缺 CENTER 节点也必须给出板位（退回板根）"
+        );
+        let want_plate = to_ros_vec3(red_rotor_at + plates[0]);
+        let got_plate = Vec3::from_array(red.armor_position);
+        assert!(
+            got_plate.distance(want_plate) < 1e-5,
+            "应选中距相机最近的那块板 {want_plate:?}，实际 {got_plate:?}"
+        );
+    }
+
+    /// 取不到相机时只发回转中心，板位标成不可用——不能默默发一个用错原点的板位。
+    #[test]
+    fn outpost_without_camera_reports_armor_position_invalid() {
+        let mut world = World::new();
+        spawn_outpost(
+            &mut world,
+            Team::Red,
+            Vec3::new(1.0, 1.0, 1.0),
+            &[Vec3::new(0.27, 0.0, 0.0)],
+            0,
+        );
+        let batch = collect_outposts(&mut world, None);
+        assert_eq!(batch.target_count, 1);
+        assert_eq!(batch.targets[0].armor_position_valid, 0);
+        assert_eq!(batch.targets[0].armor_position, [0.0; 3]);
+        assert_eq!(batch.targets[0].is_outpost, 1);
+    }
+
+    /// yaw 与 vyaw 必须是同一个符号约定：把转动节点按 `+vyaw*dt` 转一步，
+    /// 发布出去的 yaw 就得增加 `vyaw*dt`。
+    ///
+    /// 这条把 ROS↔Bevy 的映射钉住了。`M_ALIGN_MAT3` 把 Bevy +Y 映到 ROS +Z 且
+    /// 行列式为 +1，所以"绕 Bevy 局部 +Y 转 θ"应当等于"绕 ROS +Z 转 θ"。如果哪天
+    /// 有人给 `to_ros_vec3` 换成一个含反射的矩阵，或者把 `ros_yaw` 的欧拉序改了，
+    /// vyaw 的符号就会与 yaw 的走向相反——评估端算出来的预测误差会是转速的两倍，
+    /// 而两个数字本身看着都很正常。
+    ///
+    /// 与 `rotation.rs` 的 `signed_speed_matches_what_step_actually_rotates` 合起来
+    /// 闭合整条链：`signed_speed` -> `rotate_y` -> `ros_yaw`。
+    #[test]
+    fn outpost_yaw_advances_in_the_same_direction_as_vyaw() {
+        for team in [Team::Red, Team::Blue] {
+            let mut world = World::new();
+            let (_, rotor) = spawn_outpost(
+                &mut world,
+                team,
+                Vec3::new(0.0, 1.14, 0.0),
+                &[Vec3::new(0.27, 0.0, 0.0)],
+                0,
+            );
+
+            let before = collect_outposts(&mut world, None).targets[0];
+
+            // 按真值自己报出来的 vyaw 转一步（rotate_y 与生产路径同一个调用）。
+            let dt = 0.02_f32;
+            let step = before.vyaw * dt;
+            let mut tf = *world.get::<Transform>(rotor).unwrap();
+            tf.rotate_y(step);
+            *world.get_mut::<Transform>(rotor).unwrap() = tf;
+            *world.get_mut::<GlobalTransform>(rotor).unwrap() = GlobalTransform::from(tf);
+
+            let after = collect_outposts(&mut world, None).targets[0];
+            let d = (after.yaw - before.yaw).rem_euclid(std::f32::consts::TAU);
+            let d = if d > std::f32::consts::PI {
+                d - std::f32::consts::TAU
+            } else {
+                d
+            };
+            assert!(
+                (d - step).abs() < 1e-4,
+                "{team:?}: vyaw={} 转 {dt}s 应让 yaw 变化 {step}，实际 {d}",
+                before.vyaw
+            );
+        }
     }
 
     #[test]
