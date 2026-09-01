@@ -22,16 +22,16 @@ impl ControllerHelp {
     const fn keyboard() -> Self {
         Self {
             source: "keyboard",
-            manual: "F3 视角 | WASD 移动 | 左键 开火（未捕获指针时先捕获）/ Esc 释放 | 右键按住 自瞄 | 鼠标或方向键 瞄准 | 空格 射击 | G 飞镖 | Q 小陀螺 | U 远程小陀螺 | F5 自瞄常开 | Tab 拍打",
-            auto_aim: "松开右键 / F5 关闭自瞄（外部接管期间鼠标与方向键不控云台）| 左键 开火 | WASD 移动 | Q 小陀螺 | U 远程小陀螺 | 外部 fire_advice 也能开火 | Tab 拍打",
+            manual: "F3 视角 | WASD 移动 | 左键 开火（未捕获指针时先捕获）/ Esc 释放 | 右键按住 自瞄+火控开火（先左键捕获指针）| 鼠标或方向键 瞄准 | 空格 射击 | G 飞镖 | Q 小陀螺 | U 远程小陀螺 | F5 自瞄常开 | Tab 拍打",
+            auto_aim: "松开右键 / F5 关闭自瞄（外部接管期间鼠标与方向键不控云台）| 识别到目标由外部火控自动开火，不用按左键（视觉侧须带 --allow-fire）| 左键 开火 | WASD 移动 | Q 小陀螺 | U 远程小陀螺 | Tab 拍打",
         }
     }
 
     const fn xbox() -> Self {
         Self {
             source: "xbox",
-            manual: "View 视角 | LS 移动 | L3 加速 | 十字键 拍打移动 | RS 瞄准 | R3+RS 拍打翻滚/俯仰 | LB 小陀螺 | Y 拍打小陀螺 | RB 射击 | X 飞镖 | 按住 RT 自瞄",
-            auto_aim: "松开 RT 关闭自瞄 | LS 移动 | L3 加速 | 十字键 拍打移动 | R3+RS 拍打翻滚/俯仰 | LB 小陀螺 | Y 拍打小陀螺 | 由外部 fire_advice 控制射击",
+            manual: "View 视角 | LS 移动 | L3 加速 | 十字键 拍打移动 | RS 瞄准 | R3+RS 拍打翻滚/俯仰 | LB 小陀螺 | Y 拍打小陀螺 | RB 射击 | X 飞镖 | 按住 RT 自瞄+火控开火",
+            auto_aim: "松开 RT 关闭自瞄 | LS 移动 | L3 加速 | 十字键 拍打移动 | R3+RS 拍打翻滚/俯仰 | LB 小陀螺 | Y 拍打小陀螺 | 识别到目标由外部火控自动开火（视觉侧须带 --allow-fire）",
         }
     }
 }
@@ -314,11 +314,19 @@ pub fn sample_keyboard_controller(
 ///    所以让按住的那一方接管：右键一按下就把锁存清零，之后松手必定回手动。
 pub fn sample_mouse_buttons(
     mouse_button: Res<ButtonInput<MouseButton>>,
+    keyboard: Res<ButtonInput<KeyCode>>,
     capture: Res<MouseCapture>,
     mut controller: ResMut<ControllerState>,
 ) {
     // 没捕获指针时不接受开火/自瞄：那时候指针可能正在点 egui inspector 或别的窗口。
     if !capture.captured {
+        return;
+    }
+    // 按 Esc 这一帧不接受任何鼠标动作。本系统刻意排在 `update_cursor_capture`
+    // 之前（捕获用的那一下左键不能同时开火），代价是 Esc 释放指针的那一帧这里
+    // 看到的 `captured` 还是 true：按住左键按 Esc 会再吐一发，按住右键按 Esc 会
+    // 再续一帧自瞄订阅。F5 的锁存是键盘显式开关，不受这一条影响。
+    if keyboard.just_pressed(KeyCode::Escape) {
         return;
     }
     if mouse_button.just_pressed(MouseButton::Right) {
@@ -613,6 +621,7 @@ fn clamp_axes_vec2(input: Vec2) -> Vec2 {
 mod tests {
     use super::*;
     use bevy::input::ButtonState;
+    use bevy::input::keyboard::{Key, KeyboardInput};
     use bevy::input::mouse::MouseButtonInput;
 
     #[test]
@@ -872,6 +881,65 @@ mod tests {
         release(&mut app, MouseButton::Right);
         app.update();
         assert_eq!(state(&app), (false, false));
+    }
+
+    /// Esc 也必须走真实消息，理由同 `send`：`just_pressed` 只有真的跑一遍
+    /// schedule 才有意义。
+    fn press_escape(app: &mut App) {
+        app.world_mut().write_message(KeyboardInput {
+            key_code: KeyCode::Escape,
+            logical_key: Key::Escape,
+            state: ButtonState::Pressed,
+            text: None,
+            repeat: false,
+            window: Entity::PLACEHOLDER,
+        });
+    }
+
+    #[test]
+    fn escape_while_the_buttons_are_held_does_not_fire_or_aim_again() {
+        // 边沿：本系统排在 `update_cursor_capture` 之前，所以 Esc 释放指针的那一帧
+        // 这里读到的 `captured` 还是 true。没有这道判据，"按住左键按 Esc" 会在交还
+        // 指针的同一帧再吐一发，"按住右键按 Esc" 会再续一帧自瞄订阅。
+        let mut app = buttons_app(true);
+        press(&mut app, MouseButton::Left);
+        press(&mut app, MouseButton::Right);
+        app.update();
+        assert_eq!(state(&app), (true, true));
+
+        press_escape(&mut app);
+        app.update();
+        assert_eq!(
+            state(&app),
+            (false, false),
+            "按 Esc 的同一帧不能再产生开火或自瞄"
+        );
+
+        // 指针交还之后，键还按着也不再生效。
+        app.world_mut().resource_mut::<MouseCapture>().captured = false;
+        app.update();
+        assert_eq!(state(&app), (false, false));
+    }
+
+    #[test]
+    fn escape_leaves_the_f5_latch_alone() {
+        // Esc 只是交还指针，不是"关自瞄"键。F5 是显式开关，按 Esc 之后仍然算生效，
+        // 否则操作手会以为自瞄已经关了。松开右键才是关掉鼠标那一路自瞄。
+        let mut app = buttons_app(true);
+        app.world_mut()
+            .resource_mut::<ControllerState>()
+            .toggle_keyboard_auto_aim();
+        press(&mut app, MouseButton::Left);
+        app.update();
+        assert_eq!(state(&app), (true, true));
+
+        press_escape(&mut app);
+        app.update();
+        assert_eq!(
+            state(&app),
+            (false, true),
+            "Esc 那一帧不再开火，但 F5 的锁存不受影响"
+        );
     }
 
     #[test]

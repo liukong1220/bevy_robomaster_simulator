@@ -33,11 +33,10 @@ pub fn update_camera_follow(
 ) {
     let gimbal_transform = gimbal.into_inner();
     let (mut camera_transform, camera_offset) = camera_query.into_inner();
+    let view_global = view_offset.into_inner();
 
     match mode.0 {
         FollowingType::Robot => {
-            let gimbal_world_rotation = infantry.rotation * gimbal_transform.rotation;
-
             // 直接取 CAM_DIRECTION 这个挂载点的世界位姿。
             //
             // 原来是 `infantry.translation + gimbal_world_rotation * cam_local`，
@@ -49,7 +48,11 @@ pub fn update_camera_follow(
             // 代价是 GlobalTransform 是上一帧 PostUpdate 传播的，机器人运动时相机
             // 位置会滞后一帧；这比 0.2m 的固定偏差小得多，而且发布给算法的外参是
             // 在 ExtractSchedule 里按真实 GlobalTransform 算的，两边仍然自洽。
-            camera_transform.translation = view_offset.translation();
+            // `CAM_DIRECTION` 的 GlobalTransform 是当前层级传播后的权威结果，确保
+            // VEHICLE 等中间节点的旋转也进入渲染相机。旧实现只拼
+            // `infantry * gimbal_local`，中间节点一旦带旋转就会让图像光轴与发布给
+            // 算法的姿态分叉。
+            camera_transform.translation = view_global.translation();
             // 光轴必须与**枪口**重合，所以要带上 Rx(90°)。
             //
             // 关键点：在 LAUNCH/CAM 这个挂载点的局部系里，枪管前向是 +Y，而 bevy
@@ -67,9 +70,8 @@ pub fn update_camera_follow(
             // 算法侧 R_camera2gimbal = [0,0,1, -1,0,0, 0,-1,0] 是纯轴置换、没有安装
             // 倾角，即它假设光轴与枪口轴重合；talos/capture.rs 发布反馈时用的也是
             // 同一个 Rx(90°)。三处必须一致，改一处就要同时改另两处。
-            camera_transform.rotation = gimbal_world_rotation
-                * launch_offset.rotation
-                * Quat::from_euler(EulerRot::ZYX, 0.0, 0.0, PI / 2.0);
+            camera_transform.rotation =
+                view_global.rotation() * Quat::from_euler(EulerRot::ZYX, 0.0, 0.0, PI / 2.0);
 
             // 临时诊断：本地量算出来的朝向 vs 挂载点真实 GlobalTransform。
             // 视觉链路要求"图像的相机位姿"和"发布给算法的相机位姿"是同一个，
@@ -84,7 +86,7 @@ pub fn update_camera_follow(
             {
                 if *dbg_left > 0 {
                     *dbg_left -= 1;
-                    let cam_g = view_offset.into_inner();
+                    let cam_g = view_global;
                     let gim_g = gimbal_global.into_inner();
                     let q = |r: Quat| format!("[{:.5},{:.5},{:.5},{:.5}]", r.x, r.y, r.z, r.w);
                     info!(
