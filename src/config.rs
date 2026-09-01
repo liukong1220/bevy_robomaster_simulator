@@ -28,6 +28,39 @@ pub struct SimulationConfig {
     pub camera: CameraConfig,
     #[serde(default)]
     pub scene: SceneConfig,
+    #[serde(default)]
+    pub auto_aim: AutoAimLinkConfig,
+}
+
+/// 外部自瞄链路的租约。见 `talos::link::AutoAimLink`。
+#[derive(Deserialize, Reflect, Clone)]
+#[serde(default)]
+pub struct AutoAimLinkConfig {
+    /// 租约时长（毫秒）。一条命令自身的年龄超过它就被拒；租约内没有新的有效命令
+    /// 就判对端失联，接管中的链路进入 `中断` 安全状态。
+    pub lease_ms: f32,
+}
+
+impl Default for AutoAimLinkConfig {
+    fn default() -> Self {
+        // 500ms 与 C++ 侧 `heartbeat_timeout_ms` 同值，且是安全停止周期
+        // (`safe_stop_period_ms` = 20ms) 的 25 倍：视觉侧正常跑的时候，半秒内一条
+        // 有效命令都没有，就不是抖动而是真断了。
+        //
+        // 不要拿它当"世界观测年龄预算"：那是 C++ 侧 `max_command_age_ms` 的事，量的
+        // 是"这条命令基于多旧的世界观测"。这里量的是"这条命令在链路上放了多久"。
+        Self { lease_ms: 500.0 }
+    }
+}
+
+impl AutoAimLinkConfig {
+    pub fn lease_secs(&self) -> f32 {
+        self.lease_ms.max(0.0) / 1000.0
+    }
+
+    pub fn lease_ns(&self) -> u64 {
+        (self.lease_ms.max(0.0) as f64 * 1e6) as u64
+    }
 }
 
 /// 场景里几个硬编码出生点的可配置版本，单位是米，坐标是 Bevy 约定
@@ -368,6 +401,7 @@ impl Default for SimulationConfig {
                     mouse_sensitivity: 0.003,
                 },
                 scene: SceneConfig::default(),
+                auto_aim: AutoAimLinkConfig::default(),
             }
         })
     }

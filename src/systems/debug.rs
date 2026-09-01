@@ -13,21 +13,32 @@ use crate::talos::AutoAimLink;
 /// 自瞄打开时云台只听共享内存里的命令（`gimbal_controls` 会直接 return），
 /// 所以"没在跟随"有三种完全不同的原因，必须能在界面上分开：视觉侧没启动
 /// （未收到）、启动过又断了（中断）、以及正常在收（在线）。
-fn link_status(auto_aim: bool, link: Option<&AutoAimLink>, now_secs: f32) -> &'static str {
-    if !auto_aim {
-        return "未订阅";
-    }
+/// 链路一行状态。文案与控制权来自**同一个** `LinkState`，不再另算一遍时间差。
+///
+/// 之前这里自己拿 `now - last_cmd_secs <= 0.5` 判"在线"，而控制权由
+/// `gimbal_controls` 里的 `if subscribed { return; }` 决定：两套判断，可以同时
+/// 显示"在线"和"云台其实归谁都说不清"。现在只读状态机，再把被拒计数附在后面
+/// ——命令一直在来但一直被拒（时间戳倒退、NaN）时，光看状态是"未收到"，
+/// 分不出"对端没启动"和"对端在发垃圾"。
+fn link_status(link: Option<&AutoAimLink>) -> String {
     let Some(link) = link else {
         // TalosPlugin 建共享内存失败时整个 plugin 提前返回，资源都不存在。
-        return "无通道";
+        return "无通道".to_string();
     };
-    match link.last_cmd_secs {
-        None => "未收到",
-        // 0.5s 与 sp_vision25 侧的 heartbeat_timeout_ms 同量级：视觉侧正常跑
-        // 时安全停止都是 20ms 一发，半秒没有任何命令就是真的断了。
-        Some(last) if now_secs - last <= 0.5 => "在线",
-        Some(_) => "中断",
+    let state = link.state();
+    let mut s = state.label().to_string();
+    if state.external_owns_gimbal() {
+        s.push_str("(云台归外部)");
     }
+    let rejected = link.rejects.total();
+    if rejected > 0 {
+        s.push_str(&format!(
+            " 拒收{}({})",
+            rejected,
+            link.last_reject.map(|r| r.label()).unwrap_or("")
+        ));
+    }
+    s
 }
 
 fn create_help_text(
@@ -35,7 +46,7 @@ fn create_help_text(
     stats: &ProjectileStatistics,
     controller: &ControllerState,
     mouse_captured: bool,
-    link: &'static str,
+    link: &str,
 ) -> Text {
     format!(
         "自瞄={} 外部命令={} 发弹总数={} 命中={} 命中率={:.1}%\n控制器={} 模式={} 鼠标={} 小陀螺={} 远程小陀螺={}\n{}",
@@ -67,8 +78,8 @@ pub fn spawn_text(commands: &mut Commands, asset_server: &AssetServer) {
         Text::new(""),
         // bevy 内置的默认字体只有拉丁字形，中文会整段渲染成缺字框。
         // assets/fonts/hud_cjk.otf 是从 Noto Sans CJK SC 子集化出来的
-        // （310 个码点 = src/ 下所有字符串字面量里的非 ASCII 字符 + 可打印
-        // ASCII，141KB），避免把 19MB 的 CJK 全字库入库。
+        // （232 个码点 = src/ 下所有字符串/字符字面量里的非 ASCII 字符 + 可打印
+        // ASCII，113KB），避免把 19MB 的 CJK 全字库入库。注释里的字不算。
         //
         // 子集必须按源码里实际出现的字符生成，不能手写字表：第一版是手列的，
         // 漏了"数""方向键""空格"等等，HUD 上就是一个个缺字框（□），而 Rust
@@ -96,7 +107,6 @@ pub fn update_help_text(
     controller: Res<ControllerState>,
     capture: Res<MouseCapture>,
     link: Option<Res<AutoAimLink>>,
-    time: Res<Time>,
 ) {
     let auto_aim = auto_aim.load(std::sync::atomic::Ordering::Acquire);
     let next = create_help_text(
@@ -104,7 +114,7 @@ pub fn update_help_text(
         &stats,
         &controller,
         capture.captured,
-        link_status(auto_aim, link.as_deref(), time.elapsed_secs()),
+        &link_status(link.as_deref()),
     );
     for mut text in text.iter_mut() {
         // 只在内容真的变了才写。无条件 `*text = ...` 每帧都触发变更检测，

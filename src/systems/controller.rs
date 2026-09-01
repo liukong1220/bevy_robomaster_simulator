@@ -22,8 +22,8 @@ impl ControllerHelp {
     const fn keyboard() -> Self {
         Self {
             source: "keyboard",
-            manual: "F3 视角 | WASD 移动 | 左键 捕获鼠标 / Esc 释放 | 鼠标或方向键 瞄准 | 空格 射击 | G 飞镖 | Q 小陀螺 | U 远程小陀螺 | F5 自瞄 | Tab 拍打",
-            auto_aim: "F5 关闭自瞄（自瞄期间鼠标与方向键不控云台）| WASD 移动 | Q 小陀螺 | U 远程小陀螺 | 由外部 fire_advice 控制射击 | Tab 拍打",
+            manual: "F3 视角 | WASD 移动 | 左键 开火（未捕获指针时先捕获）/ Esc 释放 | 右键按住 自瞄 | 鼠标或方向键 瞄准 | 空格 射击 | G 飞镖 | Q 小陀螺 | U 远程小陀螺 | F5 自瞄常开 | Tab 拍打",
+            auto_aim: "松开右键 / F5 关闭自瞄（外部接管期间鼠标与方向键不控云台）| 左键 开火 | WASD 移动 | Q 小陀螺 | U 远程小陀螺 | 外部 fire_advice 也能开火 | Tab 拍打",
         }
     }
 
@@ -198,6 +198,10 @@ impl ControllerState {
         self.active_gamepad
     }
 
+    fn clear_keyboard_auto_aim(&mut self) {
+        self.keyboard_auto_aim = false;
+    }
+
     fn toggle_keyboard_auto_aim(&mut self) {
         self.keyboard_auto_aim = !self.keyboard_auto_aim;
     }
@@ -292,6 +296,38 @@ pub fn sample_keyboard_controller(
     if keyboard.just_pressed(KeyCode::F5) {
         controller.toggle_keyboard_auto_aim();
     }
+}
+
+/// 鼠标按键 -> 开火与自瞄。
+///
+/// 约定按真车操作手的习惯：**左键开火、按住右键自瞄、松开右键回手动**。
+///
+/// 两个细节必须在这里说清楚，否则表现就是"点一下就走火"或者"按了右键没反应"：
+///
+/// 1. 这个系统刻意排在 `update_cursor_capture` **之前**，读到的是本帧点击之前的
+///    捕获状态。左键同时还是"捕获指针"的按键（见 `update_cursor_capture`），
+///    如果先更新捕获状态，那次用来捕获窗口的点击会在同一帧被当成开火。
+///    排在前面之后，捕获用的那一下不开火，继续按住则从下一帧起连续开火
+///    （连发节流仍由 `ProjectileCooldown` 负责，与空格键同一条路径）。
+/// 2. 按下右键会清掉 F5 的常开锁存。`auto_aim_active()` 是"锁存 or 按住"的或，
+///    锁存着的时候松开右键并不会关掉自瞄——那与"松开右键关闭自瞄"直接矛盾。
+///    所以让按住的那一方接管：右键一按下就把锁存清零，之后松手必定回手动。
+pub fn sample_mouse_buttons(
+    mouse_button: Res<ButtonInput<MouseButton>>,
+    capture: Res<MouseCapture>,
+    mut controller: ResMut<ControllerState>,
+) {
+    // 没捕获指针时不接受开火/自瞄：那时候指针可能正在点 egui inspector 或别的窗口。
+    if !capture.captured {
+        return;
+    }
+    if mouse_button.just_pressed(MouseButton::Right) {
+        controller.clear_keyboard_auto_aim();
+    }
+    let hold_auto_aim = mouse_button.pressed(MouseButton::Right);
+    let fire = mouse_button.pressed(MouseButton::Left);
+    controller.controlled.auto_aim |= hold_auto_aim;
+    controller.controlled.shoot |= fire;
 }
 
 /// 鼠标位移 -> 云台瞄准增量。
@@ -576,6 +612,8 @@ fn clamp_axes_vec2(input: Vec2) -> Vec2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::input::ButtonState;
+    use bevy::input::mouse::MouseButtonInput;
 
     #[test]
     fn deadzone_filters_small_stick_noise() {
@@ -651,13 +689,20 @@ mod tests {
     }
 
     fn gimbal_delta(app: &App) -> Vec2 {
-        app.world().resource::<ControllerState>().controlled.gimbal_delta
+        app.world()
+            .resource::<ControllerState>()
+            .controlled
+            .gimbal_delta
     }
 
     #[test]
     fn mouse_motion_aims_gimbal_in_first_person() {
         let mut app = mouse_app(FollowingType::Robot, true);
-        let sensitivity = app.world().resource::<SimulationConfig>().camera.mouse_sensitivity;
+        let sensitivity = app
+            .world()
+            .resource::<SimulationConfig>()
+            .camera
+            .mouse_sensitivity;
 
         push_motion(&mut app, Vec2::new(10.0, 4.0));
         app.update();
@@ -665,14 +710,24 @@ mod tests {
         // 鼠标右移 -> yaw 减小（bevy 绕 +Y 为左转）；鼠标下移(delta.y>0) -> 低头。
         // 这两个符号必须与 freecam_controls 一致，否则切视角时手感反向。
         let delta = gimbal_delta(&app);
-        assert!((delta.x - (-10.0 * sensitivity)).abs() < 1e-6, "yaw 方向或标度不对: {delta:?}");
-        assert!((delta.y - (-4.0 * sensitivity)).abs() < 1e-6, "pitch 方向或标度不对: {delta:?}");
+        assert!(
+            (delta.x - (-10.0 * sensitivity)).abs() < 1e-6,
+            "yaw 方向或标度不对: {delta:?}"
+        );
+        assert!(
+            (delta.y - (-4.0 * sensitivity)).abs() < 1e-6,
+            "pitch 方向或标度不对: {delta:?}"
+        );
     }
 
     #[test]
     fn mouse_motion_accumulates_within_one_frame() {
         let mut app = mouse_app(FollowingType::Robot, true);
-        let sensitivity = app.world().resource::<SimulationConfig>().camera.mouse_sensitivity;
+        let sensitivity = app
+            .world()
+            .resource::<SimulationConfig>()
+            .camera
+            .mouse_sensitivity;
 
         push_motion(&mut app, Vec2::new(3.0, 0.0));
         push_motion(&mut app, Vec2::new(4.0, 0.0));
@@ -693,7 +748,11 @@ mod tests {
         // 重新捕获后，释放期间攒下的位移不能被一次性甩到云台上。
         app.world_mut().resource_mut::<MouseCapture>().captured = true;
         app.update();
-        assert_eq!(gimbal_delta(&app), Vec2::ZERO, "释放期间的位移被缓存后补发了");
+        assert_eq!(
+            gimbal_delta(&app),
+            Vec2::ZERO,
+            "释放期间的位移被缓存后补发了"
+        );
     }
 
     #[test]
@@ -728,5 +787,116 @@ mod tests {
 
         assert!(controller.controlled_chassis_spin());
         assert!(controller.remote_chassis_spin());
+    }
+
+    /// 只装鼠标按键采样所需资源的最小 App。用 `InputPlugin` 而不是手搓
+    /// `ButtonInput`，因为 `just_pressed` 的生命周期（每帧清一次）只有真的跑
+    /// schedule 才成立，而"按下右键清锁存"正好依赖它。
+    fn buttons_app(captured: bool) -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.add_plugins(bevy::input::InputPlugin);
+        app.insert_resource(MouseCapture { captured });
+        app.init_resource::<ControllerState>();
+        app.add_systems(
+            Update,
+            (clear_controller_input, sample_mouse_buttons).chain(),
+        );
+        app
+    }
+
+    /// 必须走真实的输入消息，不能直接 `ButtonInput::press`：`InputPlugin` 的
+    /// `mouse_button_input_system` 在 PreUpdate 里先 `clear()` 再消费消息，手写的
+    /// `press()` 会在同一帧被那次 clear 抹掉 `just_pressed`，于是"按下右键清锁存"
+    /// 这条判据在测试里永远看不到——而真实运行里它是成立的。
+    fn send(app: &mut App, button: MouseButton, state: ButtonState) {
+        app.world_mut().write_message(MouseButtonInput {
+            button,
+            state,
+            window: Entity::PLACEHOLDER,
+        });
+    }
+
+    fn press(app: &mut App, button: MouseButton) {
+        send(app, button, ButtonState::Pressed);
+    }
+
+    fn release(app: &mut App, button: MouseButton) {
+        send(app, button, ButtonState::Released);
+    }
+
+    fn state(app: &App) -> (bool, bool) {
+        let c = app.world().resource::<ControllerState>();
+        (c.controlled.shoot, c.auto_aim_active())
+    }
+
+    #[test]
+    fn left_button_fires_while_held() {
+        let mut app = buttons_app(true);
+        press(&mut app, MouseButton::Left);
+        app.update();
+        assert_eq!(state(&app), (true, false));
+        // 按住就连发（节流交给 ProjectileCooldown，与空格键同一条路径）。
+        app.update();
+        assert_eq!(state(&app), (true, false));
+        release(&mut app, MouseButton::Left);
+        app.update();
+        assert_eq!(state(&app), (false, false));
+    }
+
+    #[test]
+    fn right_button_holds_auto_aim_and_releasing_it_returns_manual() {
+        let mut app = buttons_app(true);
+        press(&mut app, MouseButton::Right);
+        app.update();
+        assert_eq!(state(&app), (false, true));
+        app.update();
+        assert_eq!(state(&app), (false, true), "一直按住就一直自瞄");
+        release(&mut app, MouseButton::Right);
+        app.update();
+        assert_eq!(state(&app), (false, false), "松开右键必须回手动");
+    }
+
+    #[test]
+    fn holding_the_right_button_clears_the_f5_latch() {
+        // 否则 F5 常开着的时候松开右键还在自瞄，与"松开右键关闭自瞄"矛盾。
+        let mut app = buttons_app(true);
+        app.world_mut()
+            .resource_mut::<ControllerState>()
+            .toggle_keyboard_auto_aim();
+        assert!(app.world().resource::<ControllerState>().auto_aim_active());
+
+        press(&mut app, MouseButton::Right);
+        app.update();
+        assert_eq!(state(&app), (false, true));
+        release(&mut app, MouseButton::Right);
+        app.update();
+        assert_eq!(state(&app), (false, false));
+    }
+
+    #[test]
+    fn mouse_buttons_do_nothing_until_the_pointer_is_captured() {
+        // 左键同时是"捕获指针"键。这个系统排在 update_cursor_capture 之前，所以
+        // 用来捕获窗口的那一下读到的仍是 captured=false，不会走火。
+        let mut app = buttons_app(false);
+        press(&mut app, MouseButton::Left);
+        press(&mut app, MouseButton::Right);
+        app.update();
+        assert_eq!(state(&app), (false, false));
+
+        // 捕获之后（下一帧）按住的左键才开始开火。
+        app.world_mut().resource_mut::<MouseCapture>().captured = true;
+        app.update();
+        assert_eq!(state(&app), (true, true));
+    }
+
+    #[test]
+    fn left_and_right_buttons_work_together() {
+        // 真车操作手的常用组合：按住右键自瞄、同时点左键开火。
+        let mut app = buttons_app(true);
+        press(&mut app, MouseButton::Right);
+        press(&mut app, MouseButton::Left);
+        app.update();
+        assert_eq!(state(&app), (true, true));
     }
 }

@@ -9,12 +9,14 @@ use crate::talos::capture::{
     TalosCaptureContext, TalosCapturePlugin, TalosFrameStamp, advance_talos_frame_stamp,
     publish_talos_runtime_state_system,
 };
+use crate::talos::link::{AutoAimLink, LinkState, LinkVerdict};
 use bevy::ecs::system::RunSystemOnce;
 use bevy::image::BevyDefault;
 use bevy::prelude::*;
 use bevy::render::render_resource::TextureFormat;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use talos_ipc::*;
 
 #[derive(Resource)]
@@ -22,21 +24,6 @@ pub struct ShmSubscriberRes(pub Arc<Mutex<ShmSubscriber>>);
 
 #[derive(Resource, Deref, DerefMut)]
 pub struct TalosEnabled(pub AtomicBool);
-
-/// 外部云台命令的到达情况，只给 HUD 和日志用，不参与任何算法。
-///
-/// `SubscribeAutoAim` 打开后 `gimbal_controls` 直接 return，云台完全交给
-/// `process_subscription` 吃共享内存里的 `gimbal_cmd`。此时如果视觉侧没启动、
-/// 或者跑的是 `--mode=passive`（按设计永不下发控制），云台就一动不动，而 HUD
-/// 只写着"自瞄=开"——看起来就是"自瞄开了但不锁不跟"，方向键也同时是死的，
-/// 极容易被当成自瞄算法的问题。所以把"到底有没有收到命令"显式显示出来。
-#[derive(Resource, Default)]
-pub struct AutoAimLink {
-    /// 收到过的命令总数（含 `distance_m == -1` 的安全停止）。
-    pub cmd_count: u64,
-    /// 最近一次收到命令的时刻，按 `Time::elapsed_secs` 记。
-    pub last_cmd_secs: Option<f32>,
-}
 
 pub struct TalosPluginConfig {
     pub width: u32,
@@ -121,10 +108,50 @@ impl Plugin for TalosPlugin {
                 .after(advance_talos_frame_stamp)
                 .after(publish_talos_runtime_state_system),
         );
+        // 租约推进无条件每帧跑：没订阅、没命令的帧同样要让状态机前进，否则
+        // "对端断了"这件事只有等下一条命令到达才会被发现——而它可能永远不来。
+        app.add_systems(Last, advance_link_lease);
         app.add_systems(
             Last,
             process_subscription
+                .after(advance_link_lease)
                 .run_if(|enabled: Res<SubscribeAutoAim>| enabled.load(Ordering::Acquire)),
+        );
+    }
+}
+
+/// 每帧推进租约与订阅开关。`process_subscription` 之前跑。
+fn advance_link_lease(
+    time: Res<Time>,
+    config: Res<SimulationConfig>,
+    subscribed: Res<SubscribeAutoAim>,
+    mut link: ResMut<AutoAimLink>,
+    mut logged: Local<Option<LinkState>>,
+) {
+    link.tick(
+        subscribed.load(Ordering::Acquire),
+        time.elapsed_secs(),
+        &config.auto_aim,
+    );
+
+    // 与上一次**打过日志**的状态比，而不是与本次 tick 之前的状态比。
+    //
+    // 状态机有两个驱动源：这里的 tick（租约到期）和 process_subscription 里的
+    // ingest（收到命令）。只比 tick 前后的话，ingest 那一半的跃迁全部不进日志，
+    // 结果是日志里只看得到"接管 -> 待命"、看不到"待命 -> 接管"，读起来像是链路
+    // 掉了再也没回来。这个系统每帧都跑且排在消费之前，所以上一帧 ingest 造成的
+    // 变化会在这一帧被记上。
+    let after = link.state();
+    let before = logged.unwrap_or(LinkState::Unsubscribed);
+    if *logged != Some(after) {
+        *logged = Some(after);
+        info!(
+            "外部自瞄链路: {} -> {}（收到 {} 条 / 接受 {} / 拒收 {}）",
+            before.label(),
+            after.label(),
+            link.cmd_count,
+            link.accepted,
+            link.rejects.total()
         );
     }
 }
@@ -133,6 +160,7 @@ fn process_subscription(
     context: Option<Res<ShmSubscriberRes>>,
     mut commands: Commands,
     time: Res<Time>,
+    config: Res<SimulationConfig>,
     mut link: ResMut<AutoAimLink>,
     gimbal: Single<
         (&mut Transform, &mut InfantryGimbal),
@@ -155,19 +183,39 @@ fn process_subscription(
     let Some(cmd) = recv_gimbal_cmd(&ctx) else {
         return;
     };
-    // 安全停止（distance_m == -1）也算"链路活着"：它同样是视觉侧发过来的命令，
-    // 只是内容是"别动"。把它排除在计数外，HUD 就会在安全停止期间显示"无命令"，
-    // 与"视觉侧没启动"混为一谈。
-    link.cmd_count += 1;
-    link.last_cmd_secs = Some(time.elapsed_secs());
-    if cmd.distance_m == -1.0 {
-        return;
-    }
-    if cmd.fire_advice == 1 {
+
+    let now_secs = time.elapsed_secs();
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+
+    let verdict = link.ingest(&cmd, now_secs, now_ns, &config.auto_aim);
+    let fire = match verdict {
+        LinkVerdict::Control { fire } => fire,
+        // 安全停止：续租约，不动云台。
+        LinkVerdict::SafeStop => return,
+        LinkVerdict::Reject(reason) => {
+            warn!(
+                "丢弃外部云台命令（{}）: yaw={} pitch={} distance={} ts={}",
+                reason.label(),
+                cmd.yaw_deg,
+                cmd.pitch_deg,
+                cmd.distance_m,
+                cmd.timestamp_ns
+            );
+            return;
+        }
+    };
+
+    // 开火许可来自状态机，不来自 `fire_advice` 单独判断：租约外、被拒的命令一律
+    // 到不了这里，而 `allows_fire()` 保证只有"接管中"才可能发弹。
+    if fire && link.state().allows_fire() {
         commands.queue(|w: &mut World| {
             w.run_system_once(projectile_launch).unwrap();
         });
     }
+
     let yaw_f32 = (cmd.yaw_deg).to_radians();
     let pitch_f32 = (-cmd.pitch_deg - 90.0).to_radians();
     gimbal_data.local_yaw = yaw_f32;
@@ -176,7 +224,6 @@ fn process_subscription(
     let current_rotation = muzzle_offset.0.rotation();
     let delta = expected_rotation * current_rotation.inverse();
     gimbal_transform.rotation = delta * gimbal_transform.rotation;
-    //info!("yaw={} pitch={}", cmd.yaw_deg, cmd.pitch_deg);
 }
 
 fn heartbeat_system(context: Option<Res<TalosCaptureContext>>) {

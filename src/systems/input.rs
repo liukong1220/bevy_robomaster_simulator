@@ -8,6 +8,7 @@ use crate::components::{
 use crate::config::SimulationConfig;
 use crate::robomaster::vehicle::movement::VehicleDynamic;
 use crate::systems::ControllerState;
+use crate::talos::AutoAimLink;
 use avian3d::prelude::*;
 
 const CHASSIS_ROTATION_RESPONSE: f32 = 40.0;
@@ -142,17 +143,37 @@ pub fn remote_vehicle_controls(
     );
 }
 
+/// 手动能不能动云台。抽出来是为了让测试直接对着这条判据跑。
+fn manual_gimbal_allowed(enabled: &SubscribeAutoAim, link: Option<&AutoAimLink>) -> bool {
+    if !enabled.load(Ordering::Acquire) {
+        return true;
+    }
+    match link {
+        Some(link) => link.state().allows_manual_gimbal(),
+        None => true,
+    }
+}
+
 pub fn gimbal_controls(
     time: Res<Time>,
     controller: Res<ControllerState>,
     enabled: Res<SubscribeAutoAim>,
+    link: Option<Res<AutoAimLink>>,
     config: Res<SimulationConfig>,
     gimbal: Single<
         (&mut Transform, &mut InfantryGimbal),
         (With<Controlled>, Without<InfantryChassis>),
     >,
 ) {
-    if enabled.load(Ordering::Acquire) {
+    // 控制权只由链路状态机说，HUD 读的是同一个它。
+    //
+    // 之前这里只看 `SubscribeAutoAim`：F5 一开就把云台整个交出去，不管外部到底有没有
+    // 在发控制。视觉侧没启动、或者跑 passive（只发安全停止），云台就冻住、方向键和
+    // 鼠标一起变死，而 HUD 只写着"自瞄=开"。
+    //
+    // 没有 `AutoAimLink` 说明 talos 共享内存根本没建起来（`TalosPlugin::build` 提前
+    // 返回），外部命令永远不可能到达，这时把云台交出去只会让它彻底动不了。
+    if !manual_gimbal_allowed(&enabled, link.as_deref()) {
         return;
     }
 
@@ -254,6 +275,7 @@ pub fn switch_slapper_control(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::talos::link::LinkState;
 
     #[test]
     fn chassis_rotation_smoothly_ramps_towards_target_speed() {
@@ -329,5 +351,92 @@ mod tests {
         let (_, pitch, roll) = transform.rotation.to_euler(EulerRot::YXZ);
         assert!((roll + CHASSIS_TILT_LIMIT).abs() < 1e-5);
         assert!((pitch - CHASSIS_TILT_LIMIT).abs() < 1e-5);
+    }
+
+    fn engaged_link() -> AutoAimLink {
+        use crate::config::AutoAimLinkConfig;
+        use talos_ipc::GimbalCmd;
+
+        let cfg = AutoAimLinkConfig::default();
+        let mut link = AutoAimLink::default();
+        link.tick(true, 0.0, &cfg);
+        let ts = 1_700_000_000_000_000_000u64;
+        link.ingest(
+            &GimbalCmd {
+                timestamp_ns: ts,
+                yaw_deg: 1.0,
+                pitch_deg: 0.0,
+                distance_m: 3.0,
+                fire_advice: 0,
+                _pad: [0; 11],
+            },
+            0.0,
+            ts,
+            &cfg,
+        );
+        assert_eq!(link.state(), LinkState::Engaged);
+        link
+    }
+
+    #[test]
+    fn manual_gimbal_follows_the_link_state_machine_not_the_subscribe_flag() {
+        let on = SubscribeAutoAim(true.into());
+        let off = SubscribeAutoAim(false.into());
+        let engaged = engaged_link();
+
+        // 订阅关着：不管链路状态如何，云台归手动。
+        assert!(manual_gimbal_allowed(&off, Some(&engaged)));
+        // 订阅开着且外部真的在控制：手动让位。
+        assert!(!manual_gimbal_allowed(&on, Some(&engaged)));
+    }
+
+    #[test]
+    fn manual_gimbal_stays_available_while_the_peer_is_only_alive_or_absent() {
+        let on = SubscribeAutoAim(true.into());
+        let cfg = crate::config::AutoAimLinkConfig::default();
+
+        // 订阅开着但资源不存在（ShmPublisher 创建失败，TalosPlugin 提前返回）：
+        // 与其把云台永久冻住，不如让人能开。
+        assert!(manual_gimbal_allowed(&on, None));
+
+        // 已订阅、没收到过任何命令。
+        let mut waiting = AutoAimLink::default();
+        waiting.tick(true, 0.0, &cfg);
+        assert_eq!(waiting.state(), LinkState::Waiting);
+        assert!(manual_gimbal_allowed(&on, Some(&waiting)));
+
+        // 接管过之后对端只剩安全停止（passive 的 20ms 心跳）：对端活着但不控制，
+        // 控制权回手动。
+        let mut standby = engaged_link();
+        let ts = 1_700_000_000_000_000_000u64 + 400_000_000;
+        standby.ingest(
+            &talos_ipc::GimbalCmd {
+                timestamp_ns: ts,
+                distance_m: crate::talos::link::SAFE_STOP_DISTANCE,
+                ..Default::default()
+            },
+            0.4,
+            ts,
+            &cfg,
+        );
+        standby.tick(true, 0.6, &cfg);
+        assert_eq!(standby.state(), LinkState::Standby);
+        assert!(manual_gimbal_allowed(&on, Some(&standby)));
+    }
+
+    #[test]
+    fn external_link_lost_holds_the_gimbal_until_the_operator_unsubscribes() {
+        let on = SubscribeAutoAim(true.into());
+        let off = SubscribeAutoAim(false.into());
+        let cfg = crate::config::AutoAimLinkConfig::default();
+
+        let mut link = engaged_link();
+        link.tick(true, 10.0, &cfg);
+        assert_eq!(link.state(), LinkState::Lost);
+        // 中断不隐式交还手动：否则 gimbal_controls 一进来就会用手动限位重写 pitch，
+        // 把外部写进去的姿态吃掉，事后分不清这段轨迹是谁转的。
+        assert!(!manual_gimbal_allowed(&on, Some(&link)));
+        // F5 关订阅是显式的取回动作。
+        assert!(manual_gimbal_allowed(&off, Some(&link)));
     }
 }
