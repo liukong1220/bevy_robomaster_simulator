@@ -87,9 +87,13 @@ pub fn update_camera_follow(
             //
             // 算法侧 R_camera2gimbal = [0,0,1, -1,0,0, 0,-1,0] 是纯轴置换、没有安装
             // 倾角，即它假设光轴与枪口轴重合；talos/capture.rs 发布反馈时用的也是
-            // 同一个 Rx(90°)。三处必须一致，改一处就要同时改另两处。
+            // 同一个 Rx(90°)。注意 CAM_DIRECTION 节点自身已经带了相机安装旋转，不能
+            // 再拿 `view_global.rotation()` 追加一次 Rx(90°)，否则会把实际镜头翻到
+            // 约 Rx(180°)。姿态应从 SHOT_DIRECTION（与发弹同一安装基准）计算，位置
+            // 仍取 CAM_DIRECTION 的完整层级结果。
+            let camera_roll = Quat::from_euler(EulerRot::ZYX, 0.0, 0.0, PI / 2.0);
             camera_transform.rotation =
-                view_global.rotation() * Quat::from_euler(EulerRot::ZYX, 0.0, 0.0, PI / 2.0);
+                current_gimbal_global.rotation() * launch_offset.rotation * camera_roll;
 
             // 临时诊断：本地量算出来的朝向 vs 挂载点真实 GlobalTransform。
             // 视觉链路要求"图像的相机位姿"和"发布给算法的相机位姿"是同一个，

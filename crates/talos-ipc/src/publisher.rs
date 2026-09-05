@@ -1,8 +1,28 @@
 use crate::layout::*;
 use crate::shm::{ShmError, ShmRegion};
 use crate::triple_buffer::TripleBufferProducer;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+unsafe fn atomic_store_bytes(destination: *mut u8, source: *const u8, bytes: usize) {
+    for i in 0..bytes {
+        let value = unsafe { source.add(i).read() };
+        let byte = unsafe { &*(destination.add(i).cast::<AtomicU8>()) };
+        byte.store(value, Ordering::Relaxed);
+    }
+}
+
+unsafe fn publish_snapshot(destination: *mut u8, sequence: *const u32, encoded: &[u8]) {
+    let seq = unsafe { &*sequence.cast::<AtomicU32>() };
+    let begin = seq.load(Ordering::Relaxed).wrapping_add(1) | 1;
+    seq.store(begin, Ordering::SeqCst);
+    std::sync::atomic::fence(Ordering::SeqCst);
+    unsafe {
+        atomic_store_bytes(destination, encoded.as_ptr(), encoded.len());
+    }
+    std::sync::atomic::fence(Ordering::Release);
+    seq.store(begin.wrapping_add(1), Ordering::Release);
+}
 
 pub struct ShmPublisher {
     meta_region: ShmRegion,
@@ -183,6 +203,7 @@ impl ShmPublisher {
             slot.frame_seq = frame_seq;
             slot.position = position;
             slot.quaternion = quaternion;
+            slot._pad0 = [0; 4];
             slot.timestamp_ns = timestamp_ns;
             slot._pad = aux_f32_to_bytes(aux_f32);
 
@@ -218,8 +239,11 @@ impl ShmPublisher {
 
     pub fn publish_chassis_observation(&mut self, observation: ChassisObservation) {
         unsafe {
-            let meta = self.meta_region.as_mut::<ShmMetaRegion>();
-            meta.chassis_observation = observation;
+            let base = self.meta_region.as_ptr().cast::<ShmMetaRegion>();
+            let slot = core::ptr::addr_of_mut!((*base).chassis_observation);
+            let seq = core::ptr::addr_of!((*slot).seqlock);
+            let encoded = observation.encode_payload();
+            publish_snapshot(slot.cast::<u8>(), seq, &encoded);
         }
     }
 
@@ -238,43 +262,29 @@ impl ShmPublisher {
     /// 编译器也完全可以把这次结构体赋值拆分或重排。
     pub fn publish_ground_truth(&mut self, batch: &GroundTruthBatch) {
         unsafe {
-            let meta = self.meta_region.as_mut::<ShmMetaRegion>();
-            let slot = core::ptr::addr_of_mut!(meta.ground_truth);
-            let seq = &*(core::ptr::addr_of!(meta.ground_truth.seqlock) as *const AtomicU32);
-
-            // 奇数 = 正在写。上一次提交后一定是偶数（初始 0 也是偶数）。
-            let begin = seq.load(Ordering::Relaxed).wrapping_add(1) | 1;
-            seq.store(begin, Ordering::Release);
-
-            // 这道 fence 不能省：Release **store** 只阻止之前的写往后跑，不阻止
-            // 之后的写往前跑。少了它，payload 的写可以先于奇数标记可见，读端就会
-            // 看到偶数标记 + 撕裂 payload + 同一个偶数标记，前后比较照样通过。
-            // 等价于内核 seqlock 写端 `sequence++; smp_wmb();` 里的那个屏障。
-            core::sync::atomic::fence(Ordering::Release);
-
-            core::ptr::copy_nonoverlapping(
-                (batch as *const GroundTruthBatch).cast::<u8>(),
-                slot.cast::<u8>(),
-                GROUND_TRUTH_PAYLOAD_BYTES,
-            );
-
-            // 偶数 = 写完。payload 必须先于标记递增对读端可见。
-            core::sync::atomic::fence(Ordering::Release);
-            seq.store(begin.wrapping_add(1), Ordering::Release);
+            let base = self.meta_region.as_ptr().cast::<ShmMetaRegion>();
+            let slot = core::ptr::addr_of_mut!((*base).ground_truth);
+            let seq = core::ptr::addr_of!((*slot).seqlock);
+            let encoded = batch.encode_payload();
+            publish_snapshot(slot.cast::<u8>(), seq, &encoded);
         }
     }
 
     pub fn publish_runtime_state(&mut self, state: RuntimeState) {
         unsafe {
-            let meta = self.meta_region.as_mut::<ShmMetaRegion>();
-            meta.runtime_state = state;
+            let base = self.meta_region.as_ptr().cast::<ShmMetaRegion>();
+            let slot = core::ptr::addr_of_mut!((*base).runtime_state);
+            let seq = core::ptr::addr_of!((*slot).seqlock);
+            let encoded = state.encode_payload();
+            publish_snapshot(slot.cast::<u8>(), seq, &encoded);
         }
     }
 
     pub fn update_heartbeat(&mut self) {
         unsafe {
-            let meta = self.meta_region.as_mut::<ShmMetaRegion>();
-            meta.header.heartbeat_ns = Self::now_ns();
+            let base = self.meta_region.as_ptr().cast::<ShmMetaRegion>();
+            let heartbeat = core::ptr::addr_of!((*base).header.heartbeat_ns).cast::<AtomicU64>();
+            (&*heartbeat).store(Self::now_ns(), Ordering::Release);
         }
     }
 

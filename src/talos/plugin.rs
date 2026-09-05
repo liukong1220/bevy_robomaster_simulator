@@ -1,22 +1,23 @@
 use crate::capture::driver::{CaptureConfig, CapturedFrameKind};
 use crate::capture::{IMAGE_HEIGHT, IMAGE_WIDTH};
 use crate::components::{
-    Controlled, InfantryChassis, InfantryGimbal, InfantryLaunchOffset, SubscribeAutoAim,
+    Controlled, Infantry, InfantryChassis, InfantryGimbal, InfantryLaunchOffset, SubscribeAutoAim,
 };
 use crate::config::SimulationConfig;
-use crate::systems::GameplaySystems;
 use crate::systems::projectile_launch;
+use crate::systems::{GameplaySystems, clear_controller_input};
 use crate::talos::capture::{
     TalosCaptureContext, TalosCapturePlugin, TalosFrameStamp, advance_talos_frame_stamp,
-    publish_talos_runtime_state_system,
 };
 use crate::talos::link::{AutoAimLink, LinkState, LinkVerdict};
+use crate::robomaster::prelude::PowerRuneRoot;
 use bevy::ecs::system::RunSystemOnce;
 use bevy::prelude::*;
 use bevy::render::render_resource::TextureFormat;
 use bevy::transform::TransformSystems;
 use bevy::transform::helper::TransformHelper;
 use std::sync::atomic::{AtomicBool, Ordering};
+use avian3d::prelude::{AngularVelocity, LinearVelocity};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use talos_ipc::*;
@@ -32,6 +33,98 @@ pub struct TalosEnabled(pub AtomicBool);
 /// latest command once per frame.
 #[derive(Resource, Default)]
 struct ExternalFireRequest(bool);
+
+#[derive(Resource, Default)]
+pub struct ExternalCommandConsume {
+    pub consumed_commands: u32,
+    pub consumed_control_commands: u32,
+    pub consumed_fire_commands: u32,
+    pub last_command_seq: u64,
+    pub last_consume_timestamp_ns: u64,
+}
+
+#[derive(Resource)]
+pub(crate) struct ControlledMotionScenario {
+    enabled: bool,
+    initialized: bool,
+    last_offset: Vec3,
+    base_target: Option<Vec3>,
+    base_target_rot: Option<Quat>,
+    base_chassis: Option<Vec3>,
+}
+
+impl ControlledMotionScenario {
+    pub(crate) fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub(crate) fn target_offset(&self) -> Vec3 {
+        self.last_offset
+    }
+}
+
+impl Default for ControlledMotionScenario {
+    fn default() -> Self {
+        Self {
+            enabled: std::env::var("DAEDALUS_CONTROLLED_MOTION")
+                .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            initialized: false,
+            last_offset: Vec3::ZERO,
+            base_target: None,
+            base_target_rot: None,
+            base_chassis: None,
+        }
+    }
+}
+
+/// Optional deterministic scenario for the dynamic-budget gate. It drives the actual rune root,
+/// its render/collision hierarchy, and the controlled chassis velocities.
+fn controlled_motion_scenario_system(
+    time: Res<Time>,
+    mut scenario: ResMut<ControlledMotionScenario>,
+    mut rune_root: Query<&mut Transform, With<PowerRuneRoot>>,
+    mut controlled_root: Query<&mut Transform, (With<Infantry>, With<Controlled>)>,
+    mut chassis: Query<(&mut LinearVelocity, &mut AngularVelocity), With<InfantryChassis>>,
+) {
+    if !scenario.enabled {
+        return;
+    }
+    let t = time.elapsed_secs();
+    let offset = Vec3::new((0.6 * t).sin() * 0.08, 0.0, (0.6 * t).cos() * 0.05);
+    if let Ok(mut root) = rune_root.single_mut() {
+        let base = *scenario.base_target.get_or_insert(root.translation);
+        let base_rot = *scenario.base_target_rot.get_or_insert(root.rotation);
+        root.translation = base + offset;
+        root.rotation = base_rot * Quat::from_axis_angle(Vec3::Y, 0.85 * t);
+    }
+    if let Ok(mut root) = controlled_root.single_mut() {
+        let base = *scenario.base_chassis.get_or_insert(root.translation);
+        root.translation = base + Vec3::new(0.05 * (0.4 * t).sin(), 0.0, 0.0);
+    }
+    for (mut velocity, mut angular) in &mut chassis {
+        velocity.0 = Vec3::new(-0.01, 0.0, -0.04);
+        angular.0 = Vec3::new(0.0, 0.08, 0.0);
+    }
+    if !scenario.initialized {
+        scenario.initialized = true;
+    }
+    scenario.last_offset = offset;
+}
+
+impl ExternalCommandConsume {
+    fn record(&mut self, cmd: &GimbalCmd, fire: bool, timestamp_ns: u64) {
+        self.consumed_commands = self.consumed_commands.wrapping_add(1);
+        if cmd.distance_m != crate::talos::link::SAFE_STOP_DISTANCE {
+            self.consumed_control_commands = self.consumed_control_commands.wrapping_add(1);
+        }
+        if fire {
+            self.consumed_fire_commands = self.consumed_fire_commands.wrapping_add(1);
+        }
+        self.last_command_seq = cmd.command_seq;
+        self.last_consume_timestamp_ns = timestamp_ns;
+    }
+}
 
 pub struct TalosPluginConfig {
     pub width: u32,
@@ -104,6 +197,15 @@ impl Plugin for TalosPlugin {
         app.insert_resource(TalosEnabled(AtomicBool::new(true)));
         app.init_resource::<AutoAimLink>();
         app.init_resource::<ExternalFireRequest>();
+        app.init_resource::<ExternalCommandConsume>();
+        app.init_resource::<ControlledMotionScenario>();
+
+        app.add_systems(
+            Update,
+            controlled_motion_scenario_system
+                .after(clear_controller_input)
+                .in_set(GameplaySystems::Input),
+        );
 
         // External commands must change local transforms before the single production
         // TransformSystems::Propagate pass.  The former Last-stage placement was after that pass,
@@ -125,17 +227,12 @@ impl Plugin for TalosPlugin {
             launch_external_projectile.after(TransformSystems::Propagate),
         );
         app.add_systems(Last, (advance_talos_frame_stamp, heartbeat_system));
-        app.add_systems(
-            Last,
-            publish_talos_runtime_state_system.after(advance_talos_frame_stamp),
-        );
         // 真值采集必须在帧戳自增之后：它写进 TalosGroundTruthFrame 的 frame_seq
         // 要与本帧图像、同帧姿态用的是同一个号，紧随其后的 ExtractSchedule 会核对。
         app.add_systems(
             Last,
             crate::talos::ground_truth::collect_ground_truth_system
-                .after(advance_talos_frame_stamp)
-                .after(publish_talos_runtime_state_system),
+                .after(advance_talos_frame_stamp),
         );
     }
 }
@@ -260,6 +357,7 @@ fn process_subscription(
         Query<(Entity, &GlobalTransform), (With<InfantryLaunchOffset>, With<Controlled>)>,
     )>,
     mut fire_request: ResMut<ExternalFireRequest>,
+    mut consumed: ResMut<ExternalCommandConsume>,
     mut fired: Local<u64>,
 ) {
     let Some(ctx) = context else {
@@ -277,9 +375,15 @@ fn process_subscription(
 
     let verdict = link.ingest(&cmd, now_secs, now_ns, &config.auto_aim);
     let fire = match verdict {
-        LinkVerdict::Control { fire } => fire,
+        LinkVerdict::Control { fire } => {
+            consumed.record(&cmd, fire, now_ns);
+            fire
+        }
         // 安全停止：续租约，不动云台。
-        LinkVerdict::SafeStop => return,
+        LinkVerdict::SafeStop => {
+            consumed.record(&cmd, false, now_ns);
+            return;
+        }
         LinkVerdict::Reject(reason) => {
             warn!(
                 "丢弃外部云台命令（{}）: yaw={} pitch={} distance={} ts={}",
@@ -786,6 +890,7 @@ mod tests {
             app.insert_resource(SubscribeAutoAim(AtomicBool::new(true)));
             app.init_resource::<AutoAimLink>();
             app.init_resource::<ExternalFireRequest>();
+            app.init_resource::<ExternalCommandConsume>();
             app.insert_resource(ProjectileCooldown(Timer::from_seconds(
                 0.0,
                 TimerMode::Once,
@@ -838,7 +943,14 @@ mod tests {
                 .spawn((
                     Controlled,
                     InfantryViewOffset,
-                    Transform::from_xyz(0.0, 0.05, 0.12).with_rotation(mount),
+                    // CAM_DIRECTION carries the camera-native +90° roll in the real asset;
+                    // rendering must not append another roll to this node orientation.
+                    Transform::from_xyz(0.0, 0.05, 0.12).with_rotation(Quat::from_euler(
+                        EulerRot::ZYX,
+                        0.0,
+                        0.0,
+                        std::f32::consts::FRAC_PI_2,
+                    )),
                     ChildOf(gimbal),
                 ))
                 .id();
@@ -920,7 +1032,8 @@ mod tests {
                     pitch_deg: CMD.pitch_deg,
                     distance_m: 5.0,
                     fire_advice: 1,
-                    _pad: [0; 11],
+                    _pad: [0; 3],
+                    command_seq: timestamp_ns,
                 });
         }
 
@@ -1079,9 +1192,9 @@ mod tests {
             );
             assert_quat_near(
                 rendered_camera.rotation,
-                cam_direction.rotation * camera_roll,
+                shot.rotation * camera_roll,
                 TOLERANCE_DEG,
-                &format!("{phase} rendered camera rotation vs CAM_DIRECTION"),
+                &format!("{phase} rendered camera rotation follows SHOT_DIRECTION mount"),
             );
             assert_vec3_near(
                 capture_camera.translation,

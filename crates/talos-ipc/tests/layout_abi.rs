@@ -7,7 +7,7 @@
 //!
 //! 跑 `cargo test -p talos-ipc --test layout_abi -- --nocapture` 可以看到表格。
 
-use std::mem::{align_of, offset_of, size_of};
+use std::mem::{align_of, offset_of, size_of, size_of_val};
 use talos_ipc::*;
 
 fn row(name: &str, actual: usize, expected: usize) -> bool {
@@ -37,7 +37,7 @@ fn layout_abi_table_is_canonical() {
     // v2 -> v3：ShmHeader 里从 _pad 划出 capabilities，Muzzle 通道由“相对云台的
     // 局部平移”改为“枪口世界位置”。两者都是**语义**变更而非布局变更，靠版本号
     // 而不是靠尺寸差异来拒绝老发布端。
-    check("SHM_VERSION", SHM_VERSION as usize, 3);
+    check("SHM_VERSION", SHM_VERSION as usize, 4);
     check("CAP_GROUND_TRUTH", CAP_GROUND_TRUTH as usize, 1);
     check("CAP_MUZZLE_WORLD_POSE", CAP_MUZZLE_WORLD_POSE as usize, 2);
     check(
@@ -55,6 +55,16 @@ fn layout_abi_table_is_canonical() {
         "GROUND_TRUTH_PAYLOAD_BYTES",
         GROUND_TRUTH_PAYLOAD_BYTES,
         1600,
+    );
+    check(
+        "CHASSIS_OBSERVATION_PAYLOAD_BYTES",
+        CHASSIS_OBSERVATION_PAYLOAD_BYTES,
+        112,
+    );
+    check(
+        "RUNTIME_STATE_PAYLOAD_BYTES",
+        RUNTIME_STATE_PAYLOAD_BYTES,
+        56,
     );
     check("IMAGE_WIDTH", IMAGE_WIDTH as usize, 1440);
     check("IMAGE_HEIGHT", IMAGE_HEIGHT as usize, 1080);
@@ -185,6 +195,62 @@ fn layout_abi_table_is_canonical() {
     );
 
     check(
+        "GroundTruthTarget::identity offset",
+        offset_of!(GroundTruthTarget, identity),
+        54,
+    );
+    check(
+        "RuntimeState::projectile_launch offset",
+        offset_of!(RuntimeState, projectile_launch),
+        12,
+    );
+    check(
+        "RuntimeState::_pad0 offset",
+        offset_of!(RuntimeState, _pad0),
+        9,
+    );
+    check(
+        "RuntimeState::projectile_hit offset",
+        offset_of!(RuntimeState, projectile_hit),
+        16,
+    );
+    check(
+        "RuntimeState::consumed_commands offset",
+        offset_of!(RuntimeState, consumed_commands),
+        20,
+    );
+    check(
+        "RuntimeState::consumed_control_commands offset",
+        offset_of!(RuntimeState, consumed_control_commands),
+        24,
+    );
+    check(
+        "RuntimeState::consumed_fire_commands offset",
+        offset_of!(RuntimeState, consumed_fire_commands),
+        28,
+    );
+    check(
+        "RuntimeState::frame_seq offset",
+        offset_of!(RuntimeState, frame_seq),
+        32,
+    );
+    check(
+        "RuntimeState::last_command_seq offset",
+        offset_of!(RuntimeState, last_command_seq),
+        40,
+    );
+    check(
+        "RuntimeState::last_command_consume_timestamp_ns offset",
+        offset_of!(RuntimeState, last_command_consume_timestamp_ns),
+        48,
+    );
+    check(
+        "RuntimeState::seqlock offset",
+        offset_of!(RuntimeState, seqlock),
+        56,
+    );
+
+    check(
         "PoseMeta::frame_seq offset",
         offset_of!(PoseMeta, frame_seq),
         0,
@@ -204,6 +270,7 @@ fn layout_abi_table_is_canonical() {
         offset_of!(PoseMeta, timestamp_ns),
         40,
     );
+    check("PoseMeta::_pad0 offset", offset_of!(PoseMeta, _pad0), 36);
 
     check(
         "GimbalCmd::timestamp_ns offset",
@@ -229,6 +296,16 @@ fn layout_abi_table_is_canonical() {
         "GimbalCmd::fire_advice offset",
         offset_of!(GimbalCmd, fire_advice),
         20,
+    );
+    check(
+        "GimbalCmd::command_seq offset",
+        offset_of!(GimbalCmd, command_seq),
+        24,
+    );
+    check(
+        "ChassisObservation::seqlock offset",
+        offset_of!(ChassisObservation, seqlock),
+        112,
     );
 
     check("ShmHeader::magic offset", offset_of!(ShmHeader, magic), 0);
@@ -330,6 +407,21 @@ fn layout_abi_table_is_canonical() {
         offset_of!(GroundTruthTarget, yaw),
         36,
     );
+    check(
+        "GroundTruthTarget::armor_position offset",
+        offset_of!(GroundTruthTarget, armor_position),
+        40,
+    );
+    check(
+        "GroundTruthTarget::armor_position_valid offset",
+        offset_of!(GroundTruthTarget, armor_position_valid),
+        52,
+    );
+    check(
+        "GroundTruthTarget::armor_position_degraded offset",
+        offset_of!(GroundTruthTarget, armor_position_degraded),
+        53,
+    );
 
     check(
         "GroundTruthBatch::frame_seq offset",
@@ -360,6 +452,11 @@ fn layout_abi_table_is_canonical() {
         "GroundTruthBatch::runes offset",
         offset_of!(GroundTruthBatch, runes),
         1088,
+    );
+    check(
+        "GroundTruthRune::target_point_odom offset",
+        offset_of!(GroundTruthRune, target_point_odom),
+        80,
     );
     // seqlock 的偏移就是 payload 长度：两端拷贝时都只拷这段前缀，标记本身只做原子访问。
     check(
@@ -451,6 +548,206 @@ fn layout_abi_table_is_canonical() {
         "ShmMetaRegion::runtime_state offset",
         offset_of!(ShmMetaRegion, runtime_state),
         3648,
+    );
+    println!("--- 显式填充 / payload==seqlock / 具名字段尺寸和 ----------------");
+    check(
+        "ChassisObservation payload==seqlock",
+        CHASSIS_OBSERVATION_PAYLOAD_BYTES,
+        offset_of!(ChassisObservation, seqlock),
+    );
+    check(
+        "RuntimeState payload==seqlock",
+        RUNTIME_STATE_PAYLOAD_BYTES,
+        offset_of!(RuntimeState, seqlock),
+    );
+    check(
+        "GroundTruthBatch payload==seqlock",
+        GROUND_TRUTH_PAYLOAD_BYTES,
+        offset_of!(GroundTruthBatch, seqlock),
+    );
+
+    let chassis = ChassisObservation::default();
+    check(
+        "ChassisObservation::_pad offset",
+        offset_of!(ChassisObservation, _pad),
+        116,
+    );
+    check("ChassisObservation::_pad size", chassis._pad.len(), 12);
+    let runtime = RuntimeState::default();
+    check("RuntimeState::_pad0 offset", offset_of!(RuntimeState, _pad0), 9);
+    check("RuntimeState::_pad0 size", runtime._pad0.len(), 3);
+    check("RuntimeState::_pad offset", offset_of!(RuntimeState, _pad), 60);
+    check("RuntimeState::_pad size", runtime._pad.len(), 4);
+
+    let target = GroundTruthTarget::default();
+    check(
+        "GroundTruthTarget::_pad1 offset",
+        offset_of!(GroundTruthTarget, _pad1),
+        19,
+    );
+    check(
+        "GroundTruthTarget::_pad1 size",
+        size_of_val(&target._pad1),
+        1,
+    );
+    check(
+        "GroundTruthTarget::identity offset",
+        offset_of!(GroundTruthTarget, identity),
+        54,
+    );
+    check(
+        "GroundTruthTarget::_pad offset",
+        offset_of!(GroundTruthTarget, _pad),
+        56,
+    );
+    check("GroundTruthTarget::_pad size", target._pad.len(), 8);
+
+    let rune = GroundTruthRune::default();
+    check("GroundTruthRune::pad0 offset", offset_of!(GroundTruthRune, pad0), 19);
+    check("GroundTruthRune::pad0 size", size_of_val(&rune.pad0), 1);
+    check(
+        "GroundTruthRune::pad_act offset",
+        offset_of!(GroundTruthRune, pad_act),
+        77,
+    );
+    check("GroundTruthRune::pad_act size", rune.pad_act.len(), 3);
+    check(
+        "GroundTruthRune::target_point_odom offset",
+        offset_of!(GroundTruthRune, target_point_odom),
+        80,
+    );
+    check(
+        "GroundTruthRune::identity offset",
+        offset_of!(GroundTruthRune, identity),
+        92,
+    );
+    check(
+        "GroundTruthRune::identity size",
+        size_of_val(&rune.identity),
+        2,
+    );
+    check("GroundTruthRune::_pad offset", offset_of!(GroundTruthRune, _pad), 94);
+    check("GroundTruthRune::_pad size", rune._pad.len(), 34);
+
+    let batch = GroundTruthBatch::default();
+    check(
+        "GroundTruthBatch::pad_before_targets offset",
+        offset_of!(GroundTruthBatch, pad_before_targets),
+        24,
+    );
+    check(
+        "GroundTruthBatch::pad_before_targets size",
+        batch.pad_before_targets.len(),
+        8,
+    );
+    check(
+        "GroundTruthBatch::pad_before_runes offset",
+        offset_of!(GroundTruthBatch, pad_before_runes),
+        1056,
+    );
+    check(
+        "GroundTruthBatch::pad_before_runes size",
+        batch.pad_before_runes.len(),
+        32,
+    );
+    check(
+        "GroundTruthBatch::_pad offset",
+        offset_of!(GroundTruthBatch, _pad),
+        1604,
+    );
+    check("GroundTruthBatch::_pad size", batch._pad.len(), 60);
+
+    check("PoseMeta::_pad offset", offset_of!(PoseMeta, _pad), 48);
+    check("PoseMeta::_pad size", PoseMeta::default()._pad.len(), 16);
+
+    check(
+        "ChassisObservation payload named-field size sum",
+        size_of_val(&chassis.frame_seq)
+            + size_of_val(&chassis.timestamp_ns)
+            + size_of_val(&chassis.dt_s)
+            + size_of_val(&chassis.v_body)
+            + size_of_val(&chassis.wz_radps)
+            + size_of_val(&chassis.wheel_linear_mps)
+            + size_of_val(&chassis.wheel_angular_radps)
+            + size_of_val(&chassis.a_body)
+            + size_of_val(&chassis.alpha_z_radps2)
+            + size_of_val(&chassis.rpy_rad)
+            + size_of_val(&chassis.gyro_xyz_radps)
+            + size_of_val(&chassis.accel_xyz_mps2),
+        CHASSIS_OBSERVATION_PAYLOAD_BYTES,
+    );
+    check(
+        "RuntimeState payload named-field size sum",
+        size_of_val(&runtime.timestamp_ns)
+            + size_of_val(&runtime.following)
+            + size_of_val(&runtime._pad0)
+            + size_of_val(&runtime.projectile_launch)
+            + size_of_val(&runtime.projectile_hit)
+            + size_of_val(&runtime.consumed_commands)
+            + size_of_val(&runtime.consumed_control_commands)
+            + size_of_val(&runtime.consumed_fire_commands)
+            + size_of_val(&runtime.frame_seq)
+            + size_of_val(&runtime.last_command_seq)
+            + size_of_val(&runtime.last_command_consume_timestamp_ns),
+        RUNTIME_STATE_PAYLOAD_BYTES,
+    );
+    check(
+        "GroundTruthTarget named-field size sum",
+        size_of_val(&target.frame_seq)
+            + size_of_val(&target.timestamp_ns)
+            + size_of_val(&target.team)
+            + size_of_val(&target.armor_label)
+            + size_of_val(&target.is_outpost)
+            + size_of_val(&target._pad1)
+            + size_of_val(&target.position)
+            + size_of_val(&target.vyaw)
+            + size_of_val(&target.yaw)
+            + size_of_val(&target.armor_position)
+            + size_of_val(&target.armor_position_valid)
+            + size_of_val(&target.armor_position_degraded)
+            + size_of_val(&target.identity)
+            + size_of_val(&target._pad),
+        size_of::<GroundTruthTarget>(),
+    );
+    check(
+        "GroundTruthRune named-field size sum",
+        size_of_val(&rune.frame_seq)
+            + size_of_val(&rune.timestamp_ns)
+            + size_of_val(&rune.team)
+            + size_of_val(&rune.rune_mode)
+            + size_of_val(&rune.mechanism_state)
+            + size_of_val(&rune.pad0)
+            + size_of_val(&rune.r_center_odom)
+            + size_of_val(&rune.radius)
+            + size_of_val(&rune.current_angle)
+            + size_of_val(&rune.v_roll)
+            + size_of_val(&rune.direction)
+            + size_of_val(&rune.sin_amplitude)
+            + size_of_val(&rune.sin_omega)
+            + size_of_val(&rune.sin_phase)
+            + size_of_val(&rune.sin_offset)
+            + size_of_val(&rune.relative_time)
+            + size_of_val(&rune.blade_id)
+            + size_of_val(&rune.target_activations)
+            + size_of_val(&rune.pad_act)
+            + size_of_val(&rune.target_point_odom)
+            + size_of_val(&rune.identity)
+            + size_of_val(&rune._pad),
+        size_of::<GroundTruthRune>(),
+    );
+    check(
+        "GroundTruthBatch named-field size sum",
+        size_of_val(&batch.frame_seq)
+            + size_of_val(&batch.timestamp_ns)
+            + size_of_val(&batch.target_count)
+            + size_of_val(&batch.rune_count)
+            + size_of_val(&batch.pad_before_targets)
+            + size_of_val(&batch.targets)
+            + size_of_val(&batch.pad_before_runes)
+            + size_of_val(&batch.runes)
+            + size_of_val(&batch.seqlock)
+            + size_of_val(&batch._pad),
+        size_of::<GroundTruthBatch>(),
     );
 
     assert_eq!(failures, 0, "{failures} 项 ABI 与权威表不一致");

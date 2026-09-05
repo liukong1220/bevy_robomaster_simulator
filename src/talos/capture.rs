@@ -7,8 +7,9 @@ use crate::capture::{
     setup_capture_camera, setup_preview_window, sync_capture_camera,
 };
 use crate::components::{Controlled, InfantryGimbal, InfantryLaunchOffset, SubscribeAutoAim};
+use crate::statistic::ProjectileStatistics;
 use crate::systems::{ChassisObservationFrame, GameplaySystems};
-use crate::talos::plugin::{to_ros_quat, to_ros_translation};
+use crate::talos::plugin::{ExternalCommandConsume, to_ros_quat, to_ros_translation};
 use bevy::ecs::world::DeferredWorld;
 use bevy::prelude::*;
 use bevy::render::{Extract, ExtractSchedule, RenderApp, RenderSystems};
@@ -65,6 +66,7 @@ pub struct ExtractedPoseData {
     /// `None` = 本帧没采集到真值（评估侧会看到样本变少，但绝不会拿到错帧的真值）。
     ground_truth: Option<Box<GroundTruthBatch>>,
     pub valid: bool,
+    runtime_state: RuntimeState,
 }
 
 /// Pose data captured at frame snapshot time
@@ -94,6 +96,7 @@ struct TalosSnapshotSync {
     timestamp_ns: u64,
     pose: CapturedPoseData,
     ground_truth: Option<Box<GroundTruthBatch>>,
+    runtime_state: RuntimeState,
 }
 
 impl SnapshotSync for TalosSnapshotSync {
@@ -110,6 +113,7 @@ impl SnapshotSync for TalosSnapshotSync {
             timestamp_ns: self.timestamp_ns,
             pose: self.pose,
             ground_truth: self.ground_truth,
+            runtime_state: self.runtime_state,
         })
     }
 }
@@ -120,6 +124,7 @@ struct TalosSnapshot {
     timestamp_ns: u64,
     pose: CapturedPoseData,
     ground_truth: Option<Box<GroundTruthBatch>>,
+    runtime_state: RuntimeState,
 }
 
 impl SnapshotAsync for TalosSnapshot {
@@ -165,6 +170,7 @@ impl SnapshotAsync for TalosSnapshot {
                 self.frame_seq,
                 self.timestamp_ns,
                 |publisher| {
+                    publisher.publish_runtime_state(self.runtime_state);
                     publish_pose_data(publisher, self.frame_seq, self.timestamp_ns, &self.pose);
                     if let Some(batch) = self.ground_truth.as_deref() {
                         publisher.publish_ground_truth(batch);
@@ -196,6 +202,7 @@ impl GpuCaptureHandler for TalosSnapshotCreator {
             timestamp_ns: extracted.timestamp_ns,
             pose,
             ground_truth: extracted.ground_truth.clone(),
+            runtime_state: extracted.runtime_state,
         }))
     }
 }
@@ -212,24 +219,6 @@ pub struct TalosCaptureContext {
 pub struct TalosCapturePlugin {
     pub config: CaptureConfig,
     pub context: TalosCaptureContext,
-}
-
-pub fn publish_talos_runtime_state_system(
-    context: Option<Res<TalosCaptureContext>>,
-    frame_stamp: Res<TalosFrameStamp>,
-    following: Res<SubscribeAutoAim>,
-) {
-    let Some(ctx) = context else {
-        return;
-    };
-
-    if let Ok(mut publisher) = ctx.publisher.lock() {
-        publisher.publish_runtime_state(RuntimeState {
-            timestamp_ns: frame_stamp.timestamp_ns,
-            following: u8::from(following.load(Ordering::Acquire)),
-            _pad: [0; 55],
-        });
-    }
 }
 
 impl Plugin for TalosCapturePlugin {
@@ -295,9 +284,27 @@ fn extract_pose_data(
     >,
     chassis_obs: Extract<Res<ChassisObservationFrame>>,
     ground_truth: Extract<Res<TalosGroundTruthFrame>>,
+    following: Extract<Res<SubscribeAutoAim>>,
+    statistics: Extract<Res<ProjectileStatistics>>,
+    consumed: Extract<Res<ExternalCommandConsume>>,
 ) {
     pose_data.frame_seq = frame_stamp.frame_seq;
     pose_data.timestamp_ns = frame_stamp.timestamp_ns;
+    pose_data.runtime_state = RuntimeState {
+        timestamp_ns: frame_stamp.timestamp_ns,
+        following: u8::from(following.load(Ordering::Acquire)),
+        _pad0: [0; 3],
+        projectile_launch: statistics.launch_count,
+        projectile_hit: statistics.accurate_count,
+        consumed_commands: consumed.consumed_commands,
+        consumed_control_commands: consumed.consumed_control_commands,
+        consumed_fire_commands: consumed.consumed_fire_commands,
+        frame_seq: frame_stamp.frame_seq,
+        last_command_seq: consumed.last_command_seq,
+        last_command_consume_timestamp_ns: consumed.last_consume_timestamp_ns,
+        seqlock: 0,
+        _pad: [0; 4],
+    };
 
     // 真值必须来自**同一个** frame_seq 的采集。真值采集系统在主世界的 `Last` 里跑、
     // 本函数在紧随其后的 ExtractSchedule 里跑，正常情况下两者帧号相等；一旦不等
@@ -324,7 +331,7 @@ fn extract_pose_data(
         return;
     };
 
-    pose_data.pose = Some(captured_pose_data(
+    let captured = captured_pose_data(
         cam_transform,
         gimbal_transform,
         muzzle_global,
@@ -332,7 +339,8 @@ fn extract_pose_data(
         &chassis_obs,
         pose_data.frame_seq,
         pose_data.timestamp_ns,
-    ));
+    );
+    pose_data.pose = Some(captured);
     pose_data.valid = true;
 }
 
@@ -392,7 +400,8 @@ pub(crate) fn captured_pose_data(
                 chassis_obs.accel_xyz_mps2.y,
                 chassis_obs.accel_xyz_mps2.z,
             ],
-            _pad: [0; 16],
+            seqlock: 0,
+            _pad: [0; 12],
         },
     }
 }

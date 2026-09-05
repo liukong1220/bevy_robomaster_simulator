@@ -189,6 +189,15 @@ impl MechanismState {
             Self::Activated { .. } => [Activation::Completed; RUNE_TARGET_COUNT],
         }
     }
+    /// Logical blade the aim path should track: first Activating, else Activated, else Completed.
+    pub fn current_target_index(&self) -> Option<usize> {
+        let states = self.target_states();
+        states
+            .iter()
+            .position(|a| *a == Activation::Activating)
+            .or_else(|| states.iter().position(|a| *a == Activation::Activated))
+            .or_else(|| states.iter().position(|a| *a == Activation::Completed))
+    }
 
     pub fn root_activation(&self) -> Activation {
         match self {

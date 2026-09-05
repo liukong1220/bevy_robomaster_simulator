@@ -48,6 +48,75 @@ fn rune_mode_to_u8(m: &RuneMode) -> u8 {
     }
 }
 
+/// Exact POWER.glb bullseye node statuses. LEGGING/PADDING share the TARGET_ prefix
+/// but are not the 0.7 m aim point and must never enter blade geometry.
+fn parse_rune_bullseye_node(face_prefix: &str, node_name: &str) -> Option<usize> {
+    let rest = node_name.strip_prefix(face_prefix)?;
+    let (target_id, status) = rest.split_once('_')?;
+    if !matches!(status, "ACTIVATED" | "ACTIVE" | "COMPLETED" | "DISABLED") {
+        return None;
+    }
+    let target_id = target_id.parse::<usize>().ok()?;
+    (1..=5).contains(&target_id).then_some(target_id - 1)
+}
+
+fn rune_face_index(name: &str) -> Option<usize> {
+    let rest = name.strip_prefix("FACE_")?;
+    if rest.contains('_') {
+        return None;
+    }
+    rest.parse().ok()
+}
+
+fn rune_blade_identity(face_index: usize, blade_id: usize) -> u16 {
+    ((face_index as u16) << 8) | (blade_id as u16)
+}
+
+/// Return the current blade bullseye from POWER.glb node names.
+///
+/// Logical blade id is `FACE_<face>_TARGET_<1..5>` and is independent of ECS order.
+/// Only ACTIVATED/ACTIVE/COMPLETED/DISABLED nodes are accepted. When `preferred_blade`
+/// is set (mechanism Activating/Activated/Completed), that blade is published; otherwise
+/// the lowest id with a valid bullseye is used as a diagnostic fallback.
+fn rune_blade_geometry(
+    rune: Entity,
+    center: Vec3,
+    preferred_blade: Option<usize>,
+    qq: &HierarchyQuery,
+    named_transforms: &Query<(Entity, &Name, &GlobalTransform)>,
+) -> Option<(f32, f32, usize, Vec3, u16)> {
+    let face_name = qq.name.get(rune).ok()?;
+    let face_index = rune_face_index(face_name.as_str()).unwrap_or(0);
+    let prefix = format!("{}_TARGET_", face_name.as_str());
+    let mut by_blade: HashMap<usize, Vec3> = HashMap::new();
+    for (_entity, name, tf) in named_transforms.iter() {
+        let Some(blade_id) = parse_rune_bullseye_node(&prefix, name.as_str()) else {
+            continue;
+        };
+        by_blade.entry(blade_id).or_insert(tf.translation());
+    }
+    if by_blade.is_empty() {
+        return None;
+    }
+    let blade_id = preferred_blade
+        .filter(|id| by_blade.contains_key(id))
+        .or_else(|| by_blade.keys().copied().min())?;
+    let blade = *by_blade.get(&blade_id)?;
+    let radius = blade.distance(center);
+    if !radius.is_finite() || radius <= 1e-4 {
+        return None;
+    }
+    let v = blade - center;
+    let current_angle = v.z.atan2(v.x);
+    Some((
+        radius,
+        current_angle,
+        blade_id,
+        blade,
+        rune_blade_identity(face_index, blade_id),
+    ))
+}
+
 /// Compute yaw in the ROS reference frame from a Bevy GlobalTransform.
 ///
 /// The alignment matrix maps Bevy (Y-up) → ROS (Z-up).
@@ -101,7 +170,9 @@ const OUTPOST_RADIUS_MODEL_REL_TOLERANCE: f32 = 0.20;
 const OUTPOST_RADIUS_MODEL_ABS_TOLERANCE_M: f32 = 0.02;
 const OUTPOST_RADIUS_MODEL_MIN_RADIUS_M: f32 = 0.05;
 
-fn select_outpost_plate_reference(candidates: &[PlateCandidate]) -> Option<Vec3> {
+fn select_outpost_plate_reference_with_support(
+    candidates: &[PlateCandidate],
+) -> Option<(Vec3, usize)> {
     // Fit the densest equal-radius cluster instead of trusting an asset label or an absolute
     // radius.  The intended model has three members; a two-member cluster remains admissible for
     // the known constructor-degraded case, while an isolated far-away node is rejected.
@@ -134,7 +205,7 @@ fn select_outpost_plate_reference(candidates: &[PlateCandidate]) -> Option<Vec3>
         .iter()
         .filter(|candidate| (candidate.outpost_radius_m - radius).abs() <= tolerance)
         .min_by(|a, b| a.distance_squared.total_cmp(&b.distance_squared))
-        .map(|candidate| candidate.world)
+        .map(|candidate| (candidate.world, support))
 }
 
 /// 找到"自瞄真正会瞄的那块装甲板"的板位世界位置（ROS 系）。
@@ -156,6 +227,18 @@ fn select_plate_reference(
     armor_roots: &Query<(Entity, &Armor), With<ArmorRoot>>,
     transforms: &Query<&GlobalTransform>,
 ) -> Option<Vec3> {
+    select_plate_reference_with_support(root, camera_pos, reference, qq, armor_roots, transforms)
+        .map(|(world, _)| world)
+}
+
+fn select_plate_reference_with_support(
+    root: Entity,
+    camera_pos: Vec3,
+    reference: PlateReference,
+    qq: &HierarchyQuery,
+    armor_roots: &Query<(Entity, &Armor), With<ArmorRoot>>,
+    transforms: &Query<&GlobalTransform>,
+) -> Option<(Vec3, usize)> {
     let rotor_tf = (reference == PlateReference::CenterNodeOrPlateRoot)
         .then(|| transforms.get(root).ok())
         .flatten();
@@ -214,10 +297,12 @@ fn select_plate_reference(
         PlateReference::CenterNode => candidates
             .iter()
             .min_by(|a, b| a.distance_squared.total_cmp(&b.distance_squared))
-            .map(|candidate| candidate.world),
-        PlateReference::CenterNodeOrPlateRoot => select_outpost_plate_reference(&candidates),
+            .map(|candidate| (candidate.world, candidates.len())),
+        PlateReference::CenterNodeOrPlateRoot => {
+            select_outpost_plate_reference_with_support(&candidates)
+        }
     }?;
-    Some(to_ros_vec3(world))
+    Some((to_ros_vec3(world.0), world.1))
 }
 
 /// 把场景里的前哨站写进真值批次。
@@ -266,7 +351,7 @@ fn push_outpost_targets(
         // 板位：三块板里距相机最近的那一块。OUTPOST.glb 没有 CENTER 节点，
         // 退回板根（见 `PlateReference::CenterNodeOrPlateRoot` 的实测依据）。
         let armor = camera_pos.and_then(|camera_pos| {
-            select_plate_reference(
+            select_plate_reference_with_support(
                 rotor,
                 camera_pos,
                 PlateReference::CenterNodeOrPlateRoot,
@@ -275,6 +360,8 @@ fn push_outpost_targets(
                 transforms,
             )
         });
+        let armor_position = armor.map(|(a, _)| a);
+        let armor_support = armor.map(|(_, support)| support).unwrap_or(0);
 
         let idx = batch.target_count as usize;
         batch.targets[idx] = GroundTruthTarget {
@@ -287,9 +374,11 @@ fn push_outpost_targets(
             position: [pos_ros.x, pos_ros.y, pos_ros.z],
             vyaw: rotator.signed_yaw_rate(outpost_mode),
             yaw: ros_yaw(rotor_tf),
-            armor_position: armor.map(|a| [a.x, a.y, a.z]).unwrap_or([0.0; 3]),
-            armor_position_valid: u8::from(armor.is_some()),
-            _pad: [0; 11],
+            armor_position: armor_position.map(|a| [a.x, a.y, a.z]).unwrap_or([0.0; 3]),
+            armor_position_valid: u8::from(armor_position.is_some()),
+            armor_position_degraded: u8::from(armor_position.is_none() || armor_support < 3),
+            identity: rotor.to_bits() as u16,
+            _pad: [0; 8],
         };
         batch.target_count += 1;
     }
@@ -337,12 +426,14 @@ pub fn collect_ground_truth_system(
     outpost_rotors: Query<(Entity, &OutpostRotator, &GlobalTransform)>,
     outpost_mode: Option<Res<OutpostRotationMode>>,
     rune_query: Query<(
+        Entity,
         &GlobalTransform,
         &Transform,
         &PowerRune,
         &PowerRuneMechanism,
         &PowerRuneRotation,
     )>,
+    named_transforms: Query<(Entity, &Name, &GlobalTransform)>,
 ) {
     // 没有采集上下文就没有图像事务，真值也无处提交。清掉上一帧的残留，
     // 免得它被误当成本帧的数据。
@@ -396,7 +487,9 @@ pub fn collect_ground_truth_system(
                 yaw,
                 armor_position: [0.0; 3],
                 armor_position_valid: 0,
-                _pad: [0; 11],
+                armor_position_degraded: 0,
+                identity: vehicle.to_bits() as u16,
+                _pad: [0; 8],
             };
             batch.target_count += 1;
             slot_of.insert(vehicle, idx);
@@ -434,7 +527,7 @@ pub fn collect_ground_truth_system(
     );
 
     // Collect rune ground truth
-    for (global_tf, local_tf, power_rune, mechanism, rotation) in rune_query.iter() {
+    for (rune_entity, global_tf, local_tf, power_rune, mechanism, rotation) in rune_query.iter() {
         if (batch.rune_count as usize) >= GROUND_TRUTH_MAX_RUNES {
             break;
         }
@@ -456,6 +549,31 @@ pub fn collect_ground_truth_system(
             .map(|(a, omega, t)| (a, omega, t, 2.090 - a))
             .unwrap_or((0.0, 0.0, 0.0, 0.0));
 
+        // Scene bullseye nodes are the physical blade reference. A missing/partial glTF
+        // load falls back to the rune centre with radius 0 so blade_id stays a stable 0
+        // rather than the ambiguous -1 placeholder.
+        let geometry = rune_blade_geometry(
+            rune_entity,
+            global_tf.translation(),
+            mechanism.state().current_target_index(),
+            &qq,
+            &named_transforms,
+        );
+        let face_index = qq
+            .name
+            .get(rune_entity)
+            .ok()
+            .and_then(|name| rune_face_index(name.as_str()))
+            .unwrap_or(0);
+        let (radius, blade_angle, geometry_blade_id, blade_point, identity) =
+            geometry.unwrap_or((
+                0.0,
+                current_angle,
+                0,
+                global_tf.translation(),
+                rune_blade_identity(face_index, 0),
+            ));
+
         let mut target_activations = [0u8; 5];
         for (i, a) in mechanism.state().target_states().iter().enumerate() {
             if i < 5 {
@@ -470,20 +588,30 @@ pub fn collect_ground_truth_system(
             team: team_to_u8(&power_rune.team()),
             rune_mode: rune_mode_to_u8(&power_rune.mode()),
             mechanism_state: mechanism_state_to_u8(mechanism.state()),
-            _pad1: 0,
+            pad0: 0,
             r_center_odom: [pos_ros.x, pos_ros.y, pos_ros.z],
-            radius: 0.0,
-            current_angle,
-            v_roll: 0.0,
+            radius,
+            current_angle: blade_angle,
+            v_roll: if rotation.last_speed().abs() > 1e-6 {
+                rotation.last_speed()
+            } else {
+                rotation.instantaneous_speed(power_rune.mode())
+            },
             direction,
             sin_amplitude,
             sin_omega,
             sin_phase: 0.0,
             sin_offset,
             relative_time,
-            blade_id: -1,
+            blade_id: geometry_blade_id as i32,
             target_activations,
-            _pad: [0; 20],
+            pad_act: [0; 3],
+            target_point_odom: {
+                let p = to_ros_vec3(blade_point);
+                [p.x, p.y, p.z]
+            },
+            identity,
+            _pad: [0; 34],
         };
         batch.rune_count += 1;
     }
@@ -526,7 +654,7 @@ mod tests {
         let vehicle = world.spawn(GlobalTransform::default()).id();
 
         // 三块板都挂在同一辆车下，组件集合完全相同（同一个 archetype）。
-        let mut plate = |world: &mut World, id: usize, at: Vec3| {
+        let plate = |world: &mut World, id: usize, at: Vec3| {
             let e = world
                 .spawn((
                     armor_of("plate"),
@@ -732,12 +860,75 @@ mod tests {
             red.armor_position_valid, 1,
             "前哨站缺 CENTER 节点也必须给出板位（退回板根）"
         );
+        assert_eq!(
+            red.armor_position_degraded, 0,
+            "正常三板同半径模型不得标记 degraded"
+        );
         let want_plate = to_ros_vec3(red_rotor_at + plates[0]);
         let got_plate = Vec3::from_array(red.armor_position);
         assert!(
             got_plate.distance(want_plate) < 1e-5,
             "应选中距相机最近的那块板 {want_plate:?}，实际 {got_plate:?}"
         );
+    }
+
+    /// 两块同半径板可以保留诊断板位，但必须显式标为 degraded，不能被当成三板精度基准。
+    #[test]
+    fn outpost_two_plate_model_is_marked_degraded() {
+        const R: f32 = 0.275;
+        let rotor_at = Vec3::new(1.0, 1.0, 1.0);
+        let mut world = World::new();
+        spawn_outpost(
+            &mut world,
+            Team::Blue,
+            rotor_at,
+            &[Vec3::new(R, 0.0, 0.0), Vec3::new(-R, 0.0, 0.0)],
+            0,
+        );
+        let batch = collect_outposts(&mut world, Some(rotor_at + Vec3::new(2.0, 0.0, 0.0)));
+        assert_eq!(batch.target_count, 1);
+        assert_eq!(batch.targets[0].armor_position_valid, 1);
+        assert_eq!(
+            batch.targets[0].armor_position_degraded, 1,
+            "只有两个节点不能默认为三板精度基准"
+        );
+    }
+
+    /// 三板的 120 度角间隔与回转后的局部半径都必须保持；世界坐标旋转不能绕过半径模型。
+    #[test]
+    fn outpost_three_plate_angle_spacing_survives_rotation() {
+        const R: f32 = 0.275;
+        let offsets = [
+            Vec3::new(R, 0.0, 0.0),
+            Vec3::new(-0.5 * R, 0.0, 0.8660254 * R),
+            Vec3::new(-0.5 * R, 0.0, -0.8660254 * R),
+        ];
+        for yaw_deg in [0.0_f32, 37.0, 123.0] {
+            let rotor_at = Vec3::new(-1.0, 1.0, 2.0);
+            let mut world = World::new();
+            let (_root, rotor) = spawn_outpost(&mut world, Team::Blue, rotor_at, &offsets, 0);
+            let rotation = Quat::from_rotation_y(yaw_deg.to_radians());
+            let tf = Transform::from_translation(rotor_at).with_rotation(rotation);
+            *world.get_mut::<Transform>(rotor).unwrap() = tf;
+            *world.get_mut::<GlobalTransform>(rotor).unwrap() = GlobalTransform::from(tf);
+            for (i, offset) in offsets.iter().enumerate() {
+                let plate = world
+                    .query_filtered::<(Entity, &Armor), With<ArmorRoot>>()
+                    .iter(&world)
+                    .nth(i)
+                    .map(|(entity, _)| entity)
+                    .unwrap();
+                *world.get_mut::<GlobalTransform>(plate).unwrap() =
+                    GlobalTransform::from_translation(rotor_at + rotation * *offset);
+            }
+            let batch = collect_outposts(&mut world, Some(rotor_at + Vec3::new(3.0, 0.0, 0.0)));
+            assert_eq!(batch.targets[0].armor_position_valid, 1);
+            assert_eq!(batch.targets[0].armor_position_degraded, 0);
+            let selected = Vec3::from_array(batch.targets[0].armor_position);
+            let selected_bevy = M_ALIGN_MAT3.inverse() * selected;
+            let local = rotation.inverse() * (selected_bevy - rotor_at);
+            assert!((Vec2::new(local.x, local.z).length() - R).abs() < 1e-4);
+        }
     }
 
     /// `OUTPOST_B_ROTATE/F_ARMOR_ROOT` 的水平半径约为正常板的 6.5 倍。即使它离相机
@@ -939,5 +1130,201 @@ mod tests {
             "同 label 必须靠 team 区分"
         );
         assert_eq!(b.targets[0].armor_label, b.targets[1].armor_label);
+    }
+
+    #[test]
+    fn bullseye_status_filter_rejects_legging_and_padding() {
+        let prefix = "FACE_1_TARGET_";
+        assert_eq!(
+            parse_rune_bullseye_node(prefix, "FACE_1_TARGET_1_ACTIVATED"),
+            Some(0)
+        );
+        assert_eq!(
+            parse_rune_bullseye_node(prefix, "FACE_1_TARGET_3_ACTIVE"),
+            Some(2)
+        );
+        assert_eq!(
+            parse_rune_bullseye_node(prefix, "FACE_1_TARGET_5_COMPLETED"),
+            Some(4)
+        );
+        assert_eq!(
+            parse_rune_bullseye_node(prefix, "FACE_1_TARGET_2_DISABLED"),
+            Some(1)
+        );
+        assert_eq!(
+            parse_rune_bullseye_node(prefix, "FACE_1_TARGET_1_LEGGING_1"),
+            None
+        );
+        assert_eq!(
+            parse_rune_bullseye_node(prefix, "FACE_1_TARGET_1_PADDING"),
+            None
+        );
+        assert_eq!(
+            parse_rune_bullseye_node(prefix, "FACE_1_TARGET_1_LEGGING_PROGRESSING"),
+            None
+        );
+        assert_eq!(parse_rune_bullseye_node(prefix, "FACE_1_R_PADDING"), None);
+        assert_eq!(rune_blade_identity(1, 2), (1 << 8) | 2);
+    }
+
+    #[test]
+    fn current_blade_geometry_ignores_legging_and_uses_mechanism_target() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut world = World::new();
+        let root = world.spawn(GlobalTransform::default()).id();
+        let face = world
+            .spawn((Name::new("FACE_1"), GlobalTransform::default()))
+            .id();
+        world.entity_mut(root).add_child(face);
+        let add = |world: &mut World, name: &str, at: Vec3| {
+            let entity = world
+                .spawn((
+                    Name::new(name.to_string()),
+                    GlobalTransform::from_translation(at),
+                ))
+                .id();
+            world.entity_mut(face).add_child(entity);
+            entity
+        };
+        add(
+            &mut world,
+            "FACE_1_TARGET_1_ACTIVATED",
+            Vec3::new(0.7, 0.0, 0.0),
+        );
+        add(
+            &mut world,
+            "FACE_1_TARGET_1_LEGGING_1",
+            Vec3::new(2.5, 0.0, 0.0),
+        );
+        add(
+            &mut world,
+            "FACE_1_TARGET_1_PADDING",
+            Vec3::new(2.4, 0.0, 0.0),
+        );
+        add(
+            &mut world,
+            "FACE_1_TARGET_3_ACTIVATED",
+            Vec3::new(0.0, 0.0, 0.7),
+        );
+
+        let geometry = world
+            .run_system_once(
+                move |qq: HierarchyQuery, named: Query<(Entity, &Name, &GlobalTransform)>| {
+                    rune_blade_geometry(face, Vec3::ZERO, Some(2), &qq, &named)
+                },
+            )
+            .expect("system");
+        let (radius, _angle, blade_id, point, identity) =
+            geometry.expect("bullseye geometry");
+        assert_eq!(blade_id, 2, "mechanism current blade, not ECS-first blade 0");
+        assert!(
+            (radius - 0.7).abs() < 1e-4,
+            "radius {radius} must be bullseye not LEGGING"
+        );
+        assert!(
+            point.distance(Vec3::new(0.0, 0.0, 0.7)) < 1e-4,
+            "target point must be blade 3 bullseye, got {point:?}"
+        );
+        assert_eq!(identity, rune_blade_identity(1, 2));
+
+        let fallback = world
+            .run_system_once(
+                move |qq: HierarchyQuery, named: Query<(Entity, &Name, &GlobalTransform)>| {
+                    rune_blade_geometry(face, Vec3::ZERO, None, &qq, &named)
+                },
+            )
+            .expect("system")
+            .expect("fallback geometry");
+        assert_eq!(fallback.2, 0);
+        assert!(
+            (fallback.0 - 0.7).abs() < 1e-4,
+            "fallback must still exclude LEGGING"
+        );
+    }
+
+    #[test]
+    fn power_glb_bullseye_nodes_lock_radius_near_0_7m() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/POWER.glb");
+        let data = std::fs::read(&path).expect("POWER.glb");
+        assert_eq!(&data[0..4], b"glTF");
+        let chunk_len = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
+        assert_eq!(&data[16..20], b"JSON");
+        let json: serde_json::Value =
+            serde_json::from_slice(&data[20..20 + chunk_len]).expect("gltf JSON");
+        let nodes = json["nodes"].as_array().expect("nodes");
+        let mut parent = vec![None; nodes.len()];
+        for (i, node) in nodes.iter().enumerate() {
+            if let Some(children) = node.get("children").and_then(|c| c.as_array()) {
+                for child in children {
+                    parent[child.as_u64().unwrap() as usize] = Some(i);
+                }
+            }
+        }
+        let translation = |node: &serde_json::Value| {
+            node.get("translation")
+                .and_then(|t| t.as_array())
+                .map(|t| {
+                    Vec3::new(
+                        t[0].as_f64().unwrap() as f32,
+                        t[1].as_f64().unwrap() as f32,
+                        t[2].as_f64().unwrap() as f32,
+                    )
+                })
+                .unwrap_or(Vec3::ZERO)
+        };
+        let world_of = |mut idx: usize| {
+            let mut pos = Vec3::ZERO;
+            let mut guard = 0;
+            loop {
+                pos += translation(&nodes[idx]);
+                match parent[idx] {
+                    Some(p) if guard < 32 => {
+                        idx = p;
+                        guard += 1;
+                    }
+                    _ => break pos,
+                }
+            }
+        };
+        let mut bullseye = Vec::new();
+        let mut rejected = Vec::new();
+        for (i, node) in nodes.iter().enumerate() {
+            let Some(name) = node.get("name").and_then(|n| n.as_str()) else {
+                continue;
+            };
+            for face in ["FACE_1", "FACE_2"] {
+                let prefix = format!("{face}_TARGET_");
+                let Some(center_idx) = nodes.iter().position(|n| {
+                    n.get("name").and_then(|v| v.as_str()) == Some(face)
+                }) else {
+                    continue;
+                };
+                let center = world_of(center_idx);
+                let radius = world_of(i).distance(center);
+                if parse_rune_bullseye_node(&prefix, name).is_some() {
+                    bullseye.push((name.to_string(), radius));
+                } else if name.starts_with(&prefix) {
+                    rejected.push((name.to_string(), radius));
+                }
+            }
+        }
+        assert_eq!(bullseye.len(), 40, "2 faces × 5 blades × 4 statuses");
+        for (name, radius) in &bullseye {
+            assert!(
+                (*radius - 0.7).abs() < 0.01,
+                "{name} radius {radius} must lock to ≈0.7 m"
+            );
+        }
+        let padding_far = rejected
+            .iter()
+            .filter(|(name, r)| {
+                (name.contains("PADDING") || name.contains("LEGGING")) && *r > 1.5
+            })
+            .count();
+        assert!(
+            padding_far > 0,
+            "POWER.glb must contain far LEGGING/PADDING nodes so the filter is load-bearing"
+        );
     }
 }

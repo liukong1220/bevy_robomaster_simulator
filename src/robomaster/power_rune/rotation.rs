@@ -96,22 +96,49 @@ impl RotationController {
         }
         sgn * self.baseline
     }
+
+    /// Return the instantaneous angular speed without advancing the sine clock.
+    ///
+    /// Ground-truth publication runs after the simulation update and must describe the
+    /// speed used for the current frame, but reading it must not mutate the controller.
+    pub fn instantaneous_speed(&self, mode: RuneMode) -> f32 {
+        let sgn = if self.clockwise { 1.0 } else { -1.0 };
+        if mode == RuneMode::Small {
+            return sgn * self.baseline;
+        }
+        self.variable
+            .as_ref()
+            .map(|variable| sgn * variable.speed())
+            .unwrap_or(sgn * self.baseline)
+    }
 }
 
 #[derive(Component)]
 pub struct PowerRuneRotation {
     controller: RotationController,
+    last_speed: f32,
 }
 
 impl PowerRuneRotation {
     pub fn new(clockwise: bool) -> Self {
         Self {
             controller: RotationController::new(clockwise),
+            last_speed: 0.0,
         }
     }
 
     pub fn controller(&self) -> &RotationController {
         &self.controller
+    }
+
+    pub fn instantaneous_speed(&self, mode: RuneMode) -> f32 {
+        self.controller.instantaneous_speed(mode)
+    }
+
+    /// Speed used by the most recent rotate() call.  Unlike instantaneous_speed(), this is
+    /// aligned with the transform update even when a large-rune sine parameter advances.
+    pub fn last_speed(&self) -> f32 {
+        self.last_speed
     }
 
     pub fn begin_activation(&mut self, mode: RuneMode, rng: &mut impl Rng) {
@@ -128,6 +155,7 @@ impl PowerRuneRotation {
 
     pub fn rotate(&mut self, mode: RuneMode, transform: &mut Transform, dt: f32) {
         let speed = self.controller.current_speed(mode, dt);
+        self.last_speed = speed;
         self.controller.rotate(transform, speed * dt);
     }
 }

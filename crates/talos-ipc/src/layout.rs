@@ -10,10 +10,11 @@ pub const SHM_MAGIC: u32 = 0x54414C05;
 /// v2 -> v3：`poses[Muzzle]` 由"相对云台的局部平移 + 单位四元数"改为**完整世界
 /// 位姿**（见 [`PoseIndex::Muzzle`]），并在 [`ShmHeader::capabilities`] 里显式声明
 /// 各可选区域是否有效。
+/// v4 增加固定单槽的原子 payload 快照、运行态消费回执与命令序号。
 ///
 /// 语义变更必须升版本号：字节布局没变，旧消费端照旧能 mmap、能读出数字，只是把
 /// 世界坐标当成局部偏移继续算——那是静默的错误答案，比连不上更难发现。
-pub const SHM_VERSION: u32 = 3;
+pub const SHM_VERSION: u32 = 4;
 
 /// `ShmHeader::capabilities` 的位定义。
 ///
@@ -22,7 +23,7 @@ pub const SHM_VERSION: u32 = 3;
 /// 精简发布端不会。消费端不看能力位就只能靠"读出来是不是全零"猜，而全零同样是
 /// 合法数据，于是**新消费端对着不发真值的发布端会静默失去真值**。
 pub const CAP_GROUND_TRUTH: u32 = 1 << 0;
-/// `poses[Muzzle]` 是世界位姿（v3 语义）。未置位表示 v2 的局部平移语义。
+/// `poses[Muzzle]` 是世界位姿（v3/v4 语义）。未置位表示 v2 的局部平移语义。
 pub const CAP_MUZZLE_WORLD_POSE: u32 = 1 << 1;
 /// `chassis_observation` 区有效。
 pub const CAP_CHASSIS_OBSERVATION: u32 = 1 << 2;
@@ -61,10 +62,12 @@ pub struct PoseMeta {
     pub frame_seq: u64,
     pub position: [f32; 3],
     pub quaternion: [f32; 4],
+    pub _pad0: [u8; 4],
     pub timestamp_ns: u64,
     pub _pad: [u8; 16],
 }
 const _: () = assert!(size_of::<PoseMeta>() == 64);
+const _: () = assert!(core::mem::offset_of!(PoseMeta, _pad) == 48);
 
 impl Default for PoseMeta {
     fn default() -> Self {
@@ -72,6 +75,7 @@ impl Default for PoseMeta {
             frame_seq: 0,
             position: [0.0; 3],
             quaternion: [0.0; 4],
+            _pad0: [0; 4],
             timestamp_ns: 0,
             _pad: [0; 16],
         }
@@ -86,7 +90,8 @@ pub struct GimbalCmd {
     pub pitch_deg: f32,
     pub distance_m: f32,
     pub fire_advice: u8,
-    pub _pad: [u8; 11],
+    pub _pad: [u8; 3],
+    pub command_seq: u64,
 }
 const _: () = assert!(size_of::<GimbalCmd>() == 32);
 
@@ -120,7 +125,8 @@ pub struct ChassisObservation {
     pub rpy_rad: [f32; 3],
     pub gyro_xyz_radps: [f32; 3],
     pub accel_xyz_mps2: [f32; 3],
-    pub _pad: [u8; 16],
+    pub seqlock: u32,
+    pub _pad: [u8; 12],
 }
 const _: () = assert!(size_of::<ChassisObservation>() == 128);
 
@@ -139,7 +145,8 @@ impl Default for ChassisObservation {
             rpy_rad: [0.0; 3],
             gyro_xyz_radps: [0.0; 3],
             accel_xyz_mps2: [0.0; 3],
-            _pad: [0; 16],
+            seqlock: 0,
+            _pad: [0; 12],
         }
     }
 }
@@ -211,11 +218,18 @@ pub struct GroundTruthTarget {
     /// `armor_position_valid == 0` 时该字段无意义。占用原 `_pad` 的前 16 字节。
     pub armor_position: [f32; 3],
     pub armor_position_valid: u8,
-    pub _pad: [u8; 11],
+    /// 前哨站只找到少于三块同半径板、或无法取得相机参考时的退化标记。
+    /// `armor_position_valid` 保持独立：valid=1 且 degraded=1 只能用于退化诊断，
+    /// 不能作为三板精度基准。
+    pub armor_position_degraded: u8,
+    /// Stable simulator entity identity for (team, armor_label, identity) evaluation.
+    pub identity: u16,
+    pub _pad: [u8; 8],
 }
 const _: () = assert!(size_of::<GroundTruthTarget>() == 64);
 const _: () = assert!(core::mem::offset_of!(GroundTruthTarget, armor_position) == 40);
 const _: () = assert!(core::mem::offset_of!(GroundTruthTarget, armor_position_valid) == 52);
+const _: () = assert!(core::mem::offset_of!(GroundTruthTarget, armor_position_degraded) == 53);
 
 #[repr(C, align(64))]
 #[derive(Debug, Clone, Copy)]
@@ -225,7 +239,7 @@ pub struct GroundTruthRune {
     pub team: u8,
     pub rune_mode: u8,
     pub mechanism_state: u8,
-    pub _pad1: u8,
+    pub pad0: u8,
     pub r_center_odom: [f32; 3],
     pub radius: f32,
     pub current_angle: f32,
@@ -238,9 +252,18 @@ pub struct GroundTruthRune {
     pub relative_time: f32,
     pub blade_id: i32,
     pub target_activations: [u8; 5],
-    pub _pad: [u8; 20],
+    pub pad_act: [u8; 3],
+    /// The selected blade centre in odom coordinates, not the rune centre.
+    pub target_point_odom: [f32; 3],
+    pub identity: u16,
+    pub _pad: [u8; 34],
 }
 const _: () = assert!(size_of::<GroundTruthRune>() == 128);
+const _: () = assert!(core::mem::offset_of!(GroundTruthRune, pad0) == 19);
+const _: () = assert!(core::mem::offset_of!(GroundTruthRune, pad_act) == 77);
+const _: () = assert!(core::mem::offset_of!(GroundTruthRune, target_point_odom) == 80);
+const _: () = assert!(core::mem::offset_of!(GroundTruthRune, identity) == 92);
+const _: () = assert!(core::mem::offset_of!(GroundTruthRune, _pad) == 94);
 
 impl Default for GroundTruthRune {
     fn default() -> Self {
@@ -250,7 +273,7 @@ impl Default for GroundTruthRune {
             team: 0,
             rune_mode: 0,
             mechanism_state: 0,
-            _pad1: 0,
+            pad0: 0,
             r_center_odom: [0.0; 3],
             radius: 0.0,
             current_angle: 0.0,
@@ -261,9 +284,13 @@ impl Default for GroundTruthRune {
             sin_phase: 0.0,
             sin_offset: 0.0,
             relative_time: 0.0,
-            blade_id: -1,
+            // Zero is the stable logical blade fallback for an unpopulated record.
+            blade_id: 0,
             target_activations: [0; 5],
-            _pad: [0; 20],
+            pad_act: [0; 3],
+            target_point_odom: [0.0; 3],
+            identity: 0,
+            _pad: [0; 34],
         }
     }
 }
@@ -275,7 +302,9 @@ pub struct GroundTruthBatch {
     pub timestamp_ns: u64,
     pub target_count: u32,
     pub rune_count: u32,
+    pub pad_before_targets: [u8; 8],
     pub targets: [GroundTruthTarget; GROUND_TRUTH_MAX_TARGETS],
+    pub pad_before_runes: [u8; 32],
     pub runes: [GroundTruthRune; GROUND_TRUTH_MAX_RUNES],
     /// seqlock 序号。发布端写 body 之前置奇、写完置偶；消费端读到奇数或前后不等
     /// 就重试。原来消费端靠"memcpy 前后 frame_seq 相等"近似判断整块稳定，那不是
@@ -286,6 +315,10 @@ pub struct GroundTruthBatch {
 }
 const _: () = assert!(size_of::<GroundTruthBatch>() == 1664);
 const _: () = assert!(core::mem::offset_of!(GroundTruthBatch, seqlock) == 1600);
+const _: () = assert!(core::mem::offset_of!(GroundTruthBatch, pad_before_targets) == 24);
+const _: () = assert!(core::mem::offset_of!(GroundTruthBatch, targets) == 32);
+const _: () = assert!(core::mem::offset_of!(GroundTruthBatch, pad_before_runes) == 1056);
+const _: () = assert!(core::mem::offset_of!(GroundTruthBatch, runes) == 1088);
 
 /// seqlock 标记之前的 payload 字节数，即整块里"真正的数据"。
 ///
@@ -296,6 +329,7 @@ const _: () = assert!(core::mem::offset_of!(GroundTruthBatch, seqlock) == 1600);
 ///
 /// 标记之后只有 `_pad`，所以这段前缀覆盖了全部有效字段。
 pub const GROUND_TRUTH_PAYLOAD_BYTES: usize = 1600;
+pub const CHASSIS_OBSERVATION_PAYLOAD_BYTES: usize = 112;
 const _: () =
     assert!(GROUND_TRUTH_PAYLOAD_BYTES == core::mem::offset_of!(GroundTruthBatch, seqlock));
 
@@ -306,7 +340,9 @@ impl Default for GroundTruthBatch {
             timestamp_ns: 0,
             target_count: 0,
             rune_count: 0,
+            pad_before_targets: [0; 8],
             targets: [GroundTruthTarget::default(); GROUND_TRUTH_MAX_TARGETS],
+            pad_before_runes: [0; 32],
             runes: [GroundTruthRune::default(); GROUND_TRUTH_MAX_RUNES],
             seqlock: 0,
             _pad: [0; 60],
@@ -319,7 +355,19 @@ impl Default for GroundTruthBatch {
 pub struct RuntimeState {
     pub timestamp_ns: u64,
     pub following: u8,
-    pub _pad: [u8; 55],
+    pub _pad0: [u8; 3],
+    /// Cumulative projectile counters mirrored from the simulator HUD statistics.
+    /// These occupy the former padding and therefore do not change the ABI size.
+    pub projectile_launch: u32,
+    pub projectile_hit: u32,
+    pub consumed_commands: u32,
+    pub consumed_control_commands: u32,
+    pub consumed_fire_commands: u32,
+    pub frame_seq: u64,
+    pub last_command_seq: u64,
+    pub last_command_consume_timestamp_ns: u64,
+    pub seqlock: u32,
+    pub _pad: [u8; 4],
 }
 const _: () = assert!(size_of::<RuntimeState>() == 64);
 
@@ -328,8 +376,359 @@ impl Default for RuntimeState {
         Self {
             timestamp_ns: 0,
             following: 0,
-            _pad: [0; 55],
+            _pad0: [0; 3],
+            projectile_launch: 0,
+            projectile_hit: 0,
+            consumed_commands: 0,
+            consumed_control_commands: 0,
+            consumed_fire_commands: 0,
+            frame_seq: 0,
+            last_command_seq: 0,
+            last_command_consume_timestamp_ns: 0,
+            seqlock: 0,
+            _pad: [0; 4],
         }
+    }
+}
+pub const RUNTIME_STATE_PAYLOAD_BYTES: usize = 56;
+const _: () = assert!(
+    core::mem::offset_of!(ChassisObservation, seqlock) == CHASSIS_OBSERVATION_PAYLOAD_BYTES
+);
+const _: () = assert!(core::mem::offset_of!(RuntimeState, seqlock) == RUNTIME_STATE_PAYLOAD_BYTES);
+
+#[inline]
+fn put_u8(dst: &mut [u8], off: &mut usize, v: u8) {
+    dst[*off] = v;
+    *off += 1;
+}
+
+#[inline]
+fn put_bytes(dst: &mut [u8], off: &mut usize, bytes: &[u8]) {
+    let n = bytes.len();
+    dst[*off..*off + n].copy_from_slice(bytes);
+    *off += n;
+}
+
+#[inline]
+fn put_u16(dst: &mut [u8], off: &mut usize, v: u16) {
+    put_bytes(dst, off, &v.to_le_bytes());
+}
+
+#[inline]
+fn put_u32(dst: &mut [u8], off: &mut usize, v: u32) {
+    put_bytes(dst, off, &v.to_le_bytes());
+}
+
+#[inline]
+fn put_u64(dst: &mut [u8], off: &mut usize, v: u64) {
+    put_bytes(dst, off, &v.to_le_bytes());
+}
+
+#[inline]
+fn put_i32(dst: &mut [u8], off: &mut usize, v: i32) {
+    put_bytes(dst, off, &v.to_le_bytes());
+}
+
+#[inline]
+fn put_f32(dst: &mut [u8], off: &mut usize, v: f32) {
+    put_bytes(dst, off, &v.to_le_bytes());
+}
+
+#[inline]
+fn put_f32s(dst: &mut [u8], off: &mut usize, vs: &[f32]) {
+    for v in vs {
+        put_f32(dst, off, *v);
+    }
+}
+
+#[inline]
+fn get_u8(src: &[u8], off: &mut usize) -> u8 {
+    let v = src[*off];
+    *off += 1;
+    v
+}
+
+#[inline]
+fn get_bytes<const N: usize>(src: &[u8], off: &mut usize) -> [u8; N] {
+    let mut b = [0u8; N];
+    b.copy_from_slice(&src[*off..*off + N]);
+    *off += N;
+    b
+}
+
+#[inline]
+fn get_u16(src: &[u8], off: &mut usize) -> u16 {
+    u16::from_le_bytes(get_bytes(src, off))
+}
+
+#[inline]
+fn get_u32(src: &[u8], off: &mut usize) -> u32 {
+    u32::from_le_bytes(get_bytes(src, off))
+}
+
+#[inline]
+fn get_u64(src: &[u8], off: &mut usize) -> u64 {
+    u64::from_le_bytes(get_bytes(src, off))
+}
+
+#[inline]
+fn get_i32(src: &[u8], off: &mut usize) -> i32 {
+    i32::from_le_bytes(get_bytes(src, off))
+}
+
+#[inline]
+fn get_f32(src: &[u8], off: &mut usize) -> f32 {
+    f32::from_le_bytes(get_bytes(src, off))
+}
+
+#[inline]
+fn get_f32s<const N: usize>(src: &[u8], off: &mut usize) -> [f32; N] {
+    let mut a = [0.0f32; N];
+    for slot in &mut a {
+        *slot = get_f32(src, off);
+    }
+    a
+}
+
+impl GroundTruthTarget {
+    pub fn encode_wire(&self) -> [u8; 64] {
+        let mut dst = [0u8; 64];
+        let mut off = 0;
+        put_u64(&mut dst, &mut off, self.frame_seq);
+        put_u64(&mut dst, &mut off, self.timestamp_ns);
+        put_u8(&mut dst, &mut off, self.team);
+        put_u8(&mut dst, &mut off, self.armor_label);
+        put_u8(&mut dst, &mut off, self.is_outpost);
+        put_u8(&mut dst, &mut off, self._pad1);
+        put_f32s(&mut dst, &mut off, &self.position);
+        put_f32(&mut dst, &mut off, self.vyaw);
+        put_f32(&mut dst, &mut off, self.yaw);
+        put_f32s(&mut dst, &mut off, &self.armor_position);
+        put_u8(&mut dst, &mut off, self.armor_position_valid);
+        put_u8(&mut dst, &mut off, self.armor_position_degraded);
+        put_u16(&mut dst, &mut off, self.identity);
+        put_bytes(&mut dst, &mut off, &self._pad);
+        debug_assert!(off == 64);
+        dst
+    }
+
+    pub fn decode_wire(src: &[u8; 64]) -> Self {
+        let mut off = 0;
+        let out = Self {
+            frame_seq: get_u64(src, &mut off),
+            timestamp_ns: get_u64(src, &mut off),
+            team: get_u8(src, &mut off),
+            armor_label: get_u8(src, &mut off),
+            is_outpost: get_u8(src, &mut off),
+            _pad1: get_u8(src, &mut off),
+            position: get_f32s(src, &mut off),
+            vyaw: get_f32(src, &mut off),
+            yaw: get_f32(src, &mut off),
+            armor_position: get_f32s(src, &mut off),
+            armor_position_valid: get_u8(src, &mut off),
+            armor_position_degraded: get_u8(src, &mut off),
+            identity: get_u16(src, &mut off),
+            _pad: get_bytes(src, &mut off),
+        };
+        debug_assert!(off == 64);
+        out
+    }
+}
+
+impl GroundTruthRune {
+    pub fn encode_wire(&self) -> [u8; 128] {
+        let mut dst = [0u8; 128];
+        let mut off = 0;
+        put_u64(&mut dst, &mut off, self.frame_seq);
+        put_u64(&mut dst, &mut off, self.timestamp_ns);
+        put_u8(&mut dst, &mut off, self.team);
+        put_u8(&mut dst, &mut off, self.rune_mode);
+        put_u8(&mut dst, &mut off, self.mechanism_state);
+        put_u8(&mut dst, &mut off, self.pad0);
+        put_f32s(&mut dst, &mut off, &self.r_center_odom);
+        put_f32(&mut dst, &mut off, self.radius);
+        put_f32(&mut dst, &mut off, self.current_angle);
+        put_f32(&mut dst, &mut off, self.v_roll);
+        put_i32(&mut dst, &mut off, self.direction);
+        put_f32(&mut dst, &mut off, self.sin_amplitude);
+        put_f32(&mut dst, &mut off, self.sin_omega);
+        put_f32(&mut dst, &mut off, self.sin_phase);
+        put_f32(&mut dst, &mut off, self.sin_offset);
+        put_f32(&mut dst, &mut off, self.relative_time);
+        put_i32(&mut dst, &mut off, self.blade_id);
+        put_bytes(&mut dst, &mut off, &self.target_activations);
+        put_bytes(&mut dst, &mut off, &self.pad_act);
+        put_f32s(&mut dst, &mut off, &self.target_point_odom);
+        put_u16(&mut dst, &mut off, self.identity);
+        put_bytes(&mut dst, &mut off, &self._pad);
+        debug_assert!(off == 128);
+        dst
+    }
+
+    pub fn decode_wire(src: &[u8; 128]) -> Self {
+        let mut off = 0;
+        let out = Self {
+            frame_seq: get_u64(src, &mut off),
+            timestamp_ns: get_u64(src, &mut off),
+            team: get_u8(src, &mut off),
+            rune_mode: get_u8(src, &mut off),
+            mechanism_state: get_u8(src, &mut off),
+            pad0: get_u8(src, &mut off),
+            r_center_odom: get_f32s(src, &mut off),
+            radius: get_f32(src, &mut off),
+            current_angle: get_f32(src, &mut off),
+            v_roll: get_f32(src, &mut off),
+            direction: get_i32(src, &mut off),
+            sin_amplitude: get_f32(src, &mut off),
+            sin_omega: get_f32(src, &mut off),
+            sin_phase: get_f32(src, &mut off),
+            sin_offset: get_f32(src, &mut off),
+            relative_time: get_f32(src, &mut off),
+            blade_id: get_i32(src, &mut off),
+            target_activations: get_bytes(src, &mut off),
+            pad_act: get_bytes(src, &mut off),
+            target_point_odom: get_f32s(src, &mut off),
+            identity: get_u16(src, &mut off),
+            _pad: get_bytes(src, &mut off),
+        };
+        debug_assert!(off == 128);
+        out
+    }
+}
+
+impl GroundTruthBatch {
+    pub fn encode_payload(&self) -> [u8; GROUND_TRUTH_PAYLOAD_BYTES] {
+        let mut dst = [0u8; GROUND_TRUTH_PAYLOAD_BYTES];
+        let mut off = 0;
+        put_u64(&mut dst, &mut off, self.frame_seq);
+        put_u64(&mut dst, &mut off, self.timestamp_ns);
+        put_u32(&mut dst, &mut off, self.target_count);
+        put_u32(&mut dst, &mut off, self.rune_count);
+        put_bytes(&mut dst, &mut off, &self.pad_before_targets);
+        for t in &self.targets {
+            put_bytes(&mut dst, &mut off, &t.encode_wire());
+        }
+        put_bytes(&mut dst, &mut off, &self.pad_before_runes);
+        for r in &self.runes {
+            put_bytes(&mut dst, &mut off, &r.encode_wire());
+        }
+        debug_assert!(off == GROUND_TRUTH_PAYLOAD_BYTES);
+        dst
+    }
+
+    pub fn decode_payload(src: &[u8; GROUND_TRUTH_PAYLOAD_BYTES]) -> Self {
+        let mut off = 0;
+        let mut targets = [GroundTruthTarget::default(); GROUND_TRUTH_MAX_TARGETS];
+        let mut runes = [GroundTruthRune::default(); GROUND_TRUTH_MAX_RUNES];
+        let frame_seq = get_u64(src, &mut off);
+        let timestamp_ns = get_u64(src, &mut off);
+        let target_count = get_u32(src, &mut off);
+        let rune_count = get_u32(src, &mut off);
+        let pad_before_targets = get_bytes(src, &mut off);
+        for t in &mut targets {
+            *t = GroundTruthTarget::decode_wire(&get_bytes(src, &mut off));
+        }
+        let pad_before_runes = get_bytes(src, &mut off);
+        for r in &mut runes {
+            *r = GroundTruthRune::decode_wire(&get_bytes(src, &mut off));
+        }
+        debug_assert!(off == GROUND_TRUTH_PAYLOAD_BYTES);
+        Self {
+            frame_seq,
+            timestamp_ns,
+            target_count,
+            rune_count,
+            pad_before_targets,
+            targets,
+            pad_before_runes,
+            runes,
+            seqlock: 0,
+            _pad: [0; 60],
+        }
+    }
+}
+
+impl ChassisObservation {
+    pub fn encode_payload(&self) -> [u8; CHASSIS_OBSERVATION_PAYLOAD_BYTES] {
+        let mut dst = [0u8; CHASSIS_OBSERVATION_PAYLOAD_BYTES];
+        let mut off = 0;
+        put_u64(&mut dst, &mut off, self.frame_seq);
+        put_u64(&mut dst, &mut off, self.timestamp_ns);
+        put_f32(&mut dst, &mut off, self.dt_s);
+        put_f32s(&mut dst, &mut off, &self.v_body);
+        put_f32(&mut dst, &mut off, self.wz_radps);
+        put_f32s(&mut dst, &mut off, &self.wheel_linear_mps);
+        put_f32s(&mut dst, &mut off, &self.wheel_angular_radps);
+        put_f32s(&mut dst, &mut off, &self.a_body);
+        put_f32(&mut dst, &mut off, self.alpha_z_radps2);
+        put_f32s(&mut dst, &mut off, &self.rpy_rad);
+        put_f32s(&mut dst, &mut off, &self.gyro_xyz_radps);
+        put_f32s(&mut dst, &mut off, &self.accel_xyz_mps2);
+        debug_assert!(off == CHASSIS_OBSERVATION_PAYLOAD_BYTES);
+        dst
+    }
+
+    pub fn decode_payload(src: &[u8; CHASSIS_OBSERVATION_PAYLOAD_BYTES]) -> Self {
+        let mut off = 0;
+        let out = Self {
+            frame_seq: get_u64(src, &mut off),
+            timestamp_ns: get_u64(src, &mut off),
+            dt_s: get_f32(src, &mut off),
+            v_body: get_f32s(src, &mut off),
+            wz_radps: get_f32(src, &mut off),
+            wheel_linear_mps: get_f32s(src, &mut off),
+            wheel_angular_radps: get_f32s(src, &mut off),
+            a_body: get_f32s(src, &mut off),
+            alpha_z_radps2: get_f32(src, &mut off),
+            rpy_rad: get_f32s(src, &mut off),
+            gyro_xyz_radps: get_f32s(src, &mut off),
+            accel_xyz_mps2: get_f32s(src, &mut off),
+            seqlock: 0,
+            _pad: [0; 12],
+        };
+        debug_assert!(off == CHASSIS_OBSERVATION_PAYLOAD_BYTES);
+        out
+    }
+}
+
+impl RuntimeState {
+    pub fn encode_payload(&self) -> [u8; RUNTIME_STATE_PAYLOAD_BYTES] {
+        let mut dst = [0u8; RUNTIME_STATE_PAYLOAD_BYTES];
+        let mut off = 0;
+        put_u64(&mut dst, &mut off, self.timestamp_ns);
+        put_u8(&mut dst, &mut off, self.following);
+        put_bytes(&mut dst, &mut off, &self._pad0);
+        put_u32(&mut dst, &mut off, self.projectile_launch);
+        put_u32(&mut dst, &mut off, self.projectile_hit);
+        put_u32(&mut dst, &mut off, self.consumed_commands);
+        put_u32(&mut dst, &mut off, self.consumed_control_commands);
+        put_u32(&mut dst, &mut off, self.consumed_fire_commands);
+        put_u64(&mut dst, &mut off, self.frame_seq);
+        put_u64(&mut dst, &mut off, self.last_command_seq);
+        put_u64(&mut dst, &mut off, self.last_command_consume_timestamp_ns);
+        debug_assert!(off == RUNTIME_STATE_PAYLOAD_BYTES);
+        dst
+    }
+
+    pub fn decode_payload(src: &[u8; RUNTIME_STATE_PAYLOAD_BYTES]) -> Self {
+        let mut off = 0;
+        let out = Self {
+            timestamp_ns: get_u64(src, &mut off),
+            following: get_u8(src, &mut off),
+            _pad0: get_bytes(src, &mut off),
+            projectile_launch: get_u32(src, &mut off),
+            projectile_hit: get_u32(src, &mut off),
+            consumed_commands: get_u32(src, &mut off),
+            consumed_control_commands: get_u32(src, &mut off),
+            consumed_fire_commands: get_u32(src, &mut off),
+            frame_seq: get_u64(src, &mut off),
+            last_command_seq: get_u64(src, &mut off),
+            last_command_consume_timestamp_ns: get_u64(src, &mut off),
+            seqlock: 0,
+            _pad: [0; 4],
+        };
+        debug_assert!(off == RUNTIME_STATE_PAYLOAD_BYTES);
+        out
     }
 }
 

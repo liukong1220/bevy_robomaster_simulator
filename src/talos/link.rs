@@ -348,7 +348,8 @@ mod tests {
             pitch_deg: -2.0,
             distance_m: 3.5,
             fire_advice: 0,
-            _pad: [0; 11],
+            _pad: [0; 3],
+            command_seq: 1,
         }
     }
 

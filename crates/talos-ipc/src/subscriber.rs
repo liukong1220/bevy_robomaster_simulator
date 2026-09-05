@@ -1,6 +1,31 @@
 use crate::layout::*;
 use crate::shm::{ShmError, ShmRegion};
 use crate::triple_buffer::TripleBufferConsumer;
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+
+unsafe fn read_snapshot_bytes(
+    slot: *const u8,
+    sequence: *const u32,
+    encoded: &mut [u8],
+) -> bool {
+    let seq = unsafe { &*sequence.cast::<AtomicU32>() };
+    for _ in 0..8 {
+        let before = seq.load(Ordering::Acquire);
+        if before == 0 || before & 1 != 0 {
+            continue;
+        }
+        for i in 0..encoded.len() {
+            let byte = unsafe { &*slot.add(i).cast::<AtomicU8>() };
+            encoded[i] = byte.load(Ordering::Relaxed);
+        }
+        std::sync::atomic::fence(Ordering::Acquire);
+        if before == seq.load(Ordering::Acquire) {
+            return true;
+        }
+    }
+    false
+}
+
 
 pub struct ShmSubscriber {
     meta_region: ShmRegion,
@@ -71,7 +96,16 @@ impl ShmSubscriber {
     pub fn chassis_observation(&self) -> Option<ChassisObservation> {
         unsafe {
             let meta = self.meta_region.as_ref::<ShmMetaRegion>();
-            let observation = meta.chassis_observation;
+            let slot = core::ptr::addr_of!(meta.chassis_observation);
+            let mut encoded = [0u8; CHASSIS_OBSERVATION_PAYLOAD_BYTES];
+            if !read_snapshot_bytes(
+                slot.cast::<u8>(),
+                core::ptr::addr_of!((*slot).seqlock),
+                &mut encoded,
+            ) {
+                return None;
+            }
+            let observation = ChassisObservation::decode_payload(&encoded);
             if observation.timestamp_ns == 0 {
                 None
             } else {

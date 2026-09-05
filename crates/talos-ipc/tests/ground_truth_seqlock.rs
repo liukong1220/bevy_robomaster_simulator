@@ -13,7 +13,7 @@
 //! frame_seq 不一致就说明这一批混了两次写入。只比较前后 frame_seq 是不够的——
 //! 同一帧号内重发时它根本不变。
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use talos_ipc::*;
@@ -61,6 +61,8 @@ fn stamp(generation: u32) -> GroundTruthBatch {
         r.relative_time = f;
         r.blade_id = generation as i32;
         r.target_activations = [u8v; 5];
+        r.target_point_odom = [f; 3];
+        r.identity = generation as u16;
     }
     b
 }
@@ -143,6 +145,10 @@ fn find_mixed_field(b: &GroundTruthBatch) -> Option<String> {
             Some("blade_id")
         } else if r.target_activations != [u8v; 5] {
             Some("target_activations")
+        } else if r.target_point_odom != [f; 3] {
+            Some("target_point_odom")
+        } else if r.identity != generation as u16 {
+            Some("identity")
         } else {
             None
         };
@@ -168,26 +174,20 @@ unsafe fn read_ground_truth(meta: *const ShmMetaRegion) -> Option<(GroundTruthBa
 
     for _ in 0..8 {
         let before = seq.load(Ordering::Acquire);
-        if before & 1 != 0 {
+        if before == 0 || before & 1 != 0 {
             continue; // 写入进行中
         }
-        let mut out = GroundTruthBatch::default();
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                slot.cast::<u8>(),
-                (&mut out as *mut GroundTruthBatch).cast::<u8>(),
-                GROUND_TRUTH_PAYLOAD_BYTES,
-            );
+        let mut encoded = [0u8; GROUND_TRUTH_PAYLOAD_BYTES];
+        for i in 0..GROUND_TRUTH_PAYLOAD_BYTES {
+            let byte = unsafe { &*(slot.cast::<u8>().add(i).cast::<AtomicU8>()) };
+            encoded[i] = byte.load(Ordering::Relaxed);
         }
         core::sync::atomic::fence(Ordering::Acquire);
         let after = seq.load(Ordering::Acquire);
         if before != after {
             continue;
         }
-        if before == 0 {
-            return None; // 发布端一次都没提交过
-        }
-        return Some((out, before));
+        return Some((GroundTruthBatch::decode_payload(&encoded), before));
     }
     None
 }
