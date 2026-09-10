@@ -146,10 +146,12 @@ pub fn update_cursor_capture(
     mouse_button: Res<ButtonInput<MouseButton>>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mut capture: ResMut<MouseCapture>,
+    window: Option<Single<&Window, With<PrimaryWindow>>>,
     cursor: Option<Single<&mut CursorOptions, With<PrimaryWindow>>>,
 ) {
     let mut want = capture.captured;
-    if keyboard.just_pressed(KeyCode::Escape) {
+    let focused = window.map(|w| w.focused).unwrap_or(true);
+    if keyboard.just_pressed(KeyCode::Escape) || !focused {
         want = false;
     } else if mouse_button.just_pressed(MouseButton::Left) {
         want = true;
@@ -168,6 +170,8 @@ pub fn update_cursor_capture(
     // 每帧对齐一次而不是只在切换时写：窗口失焦时 winit 会自己把 grab 放掉，
     // 只在边沿写的话回到窗口后状态就和 `capture.captured` 不一致了。
     // X11 不支持 Locked，bevy 内部会退化成 Confined。
+    // 失焦时把 captured 清掉：OpenCV 检测窗口抢走焦点后，必须重新左键捕获，
+    // 避免带着卡住的右键 pressed 一回来就再次打开自瞄。
     let grab_mode = if capture.captured {
         CursorGrabMode::Locked
     } else {

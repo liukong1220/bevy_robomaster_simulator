@@ -1,6 +1,7 @@
 use bevy::input::gamepad::{GamepadRumbleIntensity, GamepadRumbleRequest};
 use bevy::input::mouse::MouseMotion;
 use bevy::prelude::*;
+use bevy::window::PrimaryWindow;
 use core::time::Duration;
 use std::sync::atomic::Ordering;
 
@@ -312,21 +313,28 @@ pub fn sample_keyboard_controller(
 /// 2. 按下右键会清掉 F5 的常开锁存。`auto_aim_active()` 是"锁存 or 按住"的或，
 ///    锁存着的时候松开右键并不会关掉自瞄——那与"松开右键关闭自瞄"直接矛盾。
 ///    所以让按住的那一方接管：右键一按下就把锁存清零，之后松手必定回手动。
+/// 3. `--show-detect` 的 OpenCV 窗口会抢走焦点。Released 进不了 Bevy 时
+///    `pressed(Right)` 会卡住。窗口失焦时主动 release 鼠标键，回到窗口必须重新按下。
 pub fn sample_mouse_buttons(
-    mouse_button: Res<ButtonInput<MouseButton>>,
+    mut mouse_button: ResMut<ButtonInput<MouseButton>>,
     keyboard: Res<ButtonInput<KeyCode>>,
     capture: Res<MouseCapture>,
+    windows: Query<&Window, With<PrimaryWindow>>,
     mut controller: ResMut<ControllerState>,
 ) {
-    // 没捕获指针时不接受开火/自瞄：那时候指针可能正在点 egui inspector 或别的窗口。
-    if !capture.captured {
+    let focused = windows.iter().next().map(|window| window.focused).unwrap_or(true);
+
+    // `--show-detect` 的 OpenCV 窗口会抢走焦点：松开右键的 Released 落到别的窗口，
+    // Bevy 的 `pressed(Right)` 会一直为 true，表现为"松开右键却不取消自瞄"。
+    // 失焦时主动清掉鼠标键状态；回到窗口后必须重新按下，不能沿用卡住的 pressed。
+    if !focused || keyboard.just_pressed(KeyCode::Escape) {
+        mouse_button.release(MouseButton::Right);
+        mouse_button.release(MouseButton::Left);
         return;
     }
-    // 按 Esc 这一帧不接受任何鼠标动作。本系统刻意排在 `update_cursor_capture`
-    // 之前（捕获用的那一下左键不能同时开火），代价是 Esc 释放指针的那一帧这里
-    // 看到的 `captured` 还是 true：按住左键按 Esc 会再吐一发，按住右键按 Esc 会
-    // 再续一帧自瞄订阅。F5 的锁存是键盘显式开关，不受这一条影响。
-    if keyboard.just_pressed(KeyCode::Escape) {
+
+    // 没捕获指针时不接受开火/自瞄：那时候指针可能正在点 egui inspector 或别的窗口。
+    if !capture.captured {
         return;
     }
     if mouse_button.just_pressed(MouseButton::Right) {
@@ -939,6 +947,45 @@ mod tests {
             state(&app),
             (false, true),
             "Esc 那一帧不再开火，但 F5 的锁存不受影响"
+        );
+    }
+
+    #[test]
+    fn unfocus_cancels_held_right_button_auto_aim() {
+        // `--show-detect` 的 OpenCV 窗口抢走焦点后，Released 进不了 Bevy，
+        // pressed(Right) 会卡住。失焦必须清掉右键自瞄，回到窗口也不能沿用。
+        let mut app = buttons_app(true);
+        let window = app
+            .world_mut()
+            .spawn((
+                Window {
+                    focused: true,
+                    ..default()
+                },
+                PrimaryWindow,
+            ))
+            .id();
+
+        press(&mut app, MouseButton::Right);
+        app.update();
+        assert_eq!(state(&app), (false, true));
+
+        app.world_mut().entity_mut(window).insert(Window {
+            focused: false,
+            ..default()
+        });
+        app.update();
+        assert_eq!(state(&app), (false, false), "失焦必须取消右键自瞄");
+
+        app.world_mut().entity_mut(window).insert(Window {
+            focused: true,
+            ..default()
+        });
+        app.update();
+        assert_eq!(
+            state(&app),
+            (false, false),
+            "失焦期间松开的右键不能在回到窗口后卡住"
         );
     }
 
